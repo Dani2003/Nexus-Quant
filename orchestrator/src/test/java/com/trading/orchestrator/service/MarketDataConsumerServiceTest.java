@@ -11,12 +11,12 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.Acknowledgment;
-import org.springframework.kafka.support.SendResult;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyDouble;
@@ -41,6 +41,7 @@ class MarketDataConsumerServiceTest {
     @Mock
     private Acknowledgment acknowledgment;
 
+    private AuditStorageService auditStorageService;
     private MarketDataConsumerService consumerService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -49,10 +50,12 @@ class MarketDataConsumerServiceTest {
         lenient().when(kafkaTemplate.send(anyString(), anyString(), anyString()))
                 .thenReturn(CompletableFuture.completedFuture(null));
 
+        auditStorageService = new AuditStorageService();
         consumerService = new MarketDataConsumerService(
                 riskGrpcClient,
                 objectMapper,
                 kafkaTemplate,
+                auditStorageService,
                 150.0,
                 100.0,
                 "trade-orders",
@@ -97,6 +100,9 @@ class MarketDataConsumerServiceTest {
         verify(riskGrpcClient).evaluateRisk("GROWTH_1", "AAPL", 250.0, 175.50);
         // Verify approved order published to trade-orders topic
         verify(kafkaTemplate).send(eq("trade-orders"), eq("AAPL"), contains("\"status\":\"APPROVED\""));
+        // Verify decision audit trail recorded
+        assertEquals(1, auditStorageService.getRecentDecisions(10).size());
+        assertEquals("APPROVED", auditStorageService.getRecentDecisions(10).get(0).status());
         // Verify Kafka offset acknowledged ONLY after success
         verify(acknowledgment).acknowledge();
     }

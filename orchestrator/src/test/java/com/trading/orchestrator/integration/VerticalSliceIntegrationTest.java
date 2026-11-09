@@ -7,6 +7,7 @@ import com.trading.orchestrator.grpc.RiskEngineProto;
 import com.trading.orchestrator.grpc.RiskRequest;
 import com.trading.orchestrator.grpc.RiskResponse;
 import com.trading.orchestrator.grpc.RiskServiceGrpc;
+import com.trading.orchestrator.service.AuditStorageService;
 import com.trading.orchestrator.service.MarketDataConsumerService;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
@@ -52,6 +53,7 @@ class VerticalSliceIntegrationTest {
     private ManagedChannel inProcessChannel;
 
     private RiskGrpcClient riskGrpcClient;
+    private AuditStorageService auditStorageService;
     private MarketDataConsumerService consumerService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
@@ -109,10 +111,12 @@ class VerticalSliceIntegrationTest {
         // Replace internal channel and stub using reflection for pure in-process testing
         replaceClientChannelAndStub(riskGrpcClient, inProcessChannel);
 
+        auditStorageService = new AuditStorageService();
         consumerService = new MarketDataConsumerService(
                 riskGrpcClient,
                 objectMapper,
                 kafkaTemplate,
+                auditStorageService,
                 150.0,
                 100.0,
                 "trade-orders",
@@ -188,6 +192,8 @@ class VerticalSliceIntegrationTest {
 
         assertEquals(1, requestCounter.get());
         verify(kafkaTemplate).send(eq("trade-orders"), eq("AAPL"), contains("\"status\":\"APPROVED\""));
+        assertEquals(1, auditStorageService.getRecentDecisions(10).size());
+        assertEquals("APPROVED", auditStorageService.getRecentDecisions(10).get(0).status());
         verify(acknowledgment).acknowledge();
     }
 
@@ -216,6 +222,8 @@ class VerticalSliceIntegrationTest {
 
         assertEquals(1, requestCounter.get());
         verify(kafkaTemplate).send(eq("risk-rejections"), eq("TSLA"), contains("RISK_TOLERANCE_BREACH_VAR_EXCEEDED"));
+        assertEquals(1, auditStorageService.getRecentDecisions(10).size());
+        assertEquals("REJECTED_VAR_EXCEEDED", auditStorageService.getRecentDecisions(10).get(0).status());
         verify(acknowledgment).acknowledge();
     }
 

@@ -5,9 +5,11 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.trading.orchestrator.client.RiskGrpcClient;
 import com.trading.orchestrator.client.RiskServiceException;
 import com.trading.orchestrator.grpc.RiskResponse;
+import com.trading.orchestrator.model.DecisionAuditRecord;
 import com.trading.orchestrator.model.MarketTick;
 import com.trading.orchestrator.model.Order;
 import com.trading.orchestrator.model.RiskRejection;
+import com.trading.orchestrator.model.TradingEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -32,7 +34,7 @@ import java.util.concurrent.TimeUnit;
  *  1. Reliable acknowledgment tied strictly to processing completion and durable Kafka publication.
  *  2. Bounded concurrency & overload policy via Semaphore.
  *  3. Strict input validation rejecting invalid/non-finite prices.
- *  4. Idempotency guard cached ONLY after durable outcome recording.
+ *  4. Durable audit & idempotency tracking via AuditStorageService.
  *  5. Synchronous, verified publishing of orders and rejections to Kafka.
  */
 @Service
@@ -43,6 +45,7 @@ public class MarketDataConsumerService {
     private final RiskGrpcClient riskGrpcClient;
     private final ObjectMapper objectMapper;
     private final KafkaTemplate<String, String> kafkaTemplate;
+    private final AuditStorageService auditStorageService;
 
     private final double priceThreshold;
     private final double defaultTradeSize;
@@ -54,7 +57,6 @@ public class MarketDataConsumerService {
     private final long concurrencyTimeoutMs;
 
     // Bounded LRU cache for tick idempotency deduplication (capacity: 10,000)
-    // CRITICAL: Entries are inserted ONLY after processing and durable publication succeed.
     private final Set<String> processedTicksCache = Collections.newSetFromMap(
             new LinkedHashMap<String, Boolean>(10_000, 0.75f, true) {
                 @Override
@@ -68,6 +70,7 @@ public class MarketDataConsumerService {
             RiskGrpcClient riskGrpcClient,
             ObjectMapper objectMapper,
             KafkaTemplate<String, String> kafkaTemplate,
+            AuditStorageService auditStorageService,
             @Value("${trading.risk.threshold-price:150.0}") double priceThreshold,
             @Value("${trading.risk.default-proposed-trade-size:100.0}") double defaultTradeSize,
             @Value("${trading.kafka.trade-orders-topic:trade-orders}") String tradeOrdersTopic,
@@ -79,6 +82,7 @@ public class MarketDataConsumerService {
         this.riskGrpcClient = riskGrpcClient;
         this.objectMapper = objectMapper;
         this.kafkaTemplate = kafkaTemplate;
+        this.auditStorageService = auditStorageService;
         this.priceThreshold = priceThreshold;
         this.defaultTradeSize = defaultTradeSize;
         this.tradeOrdersTopic = tradeOrdersTopic;
@@ -118,7 +122,6 @@ public class MarketDataConsumerService {
         } catch (RiskServiceException e) {
             log.error("[Risk Failure] RPC failed for tick from [{}-{}@{}]: {}. Propagating to Kafka error handler for retry.",
                     topic, partition, offset, e.getMessage());
-            // Rethrow so Spring Kafka's retry and dead-letter handler can intervene deliberately
             throw e;
 
         } catch (Exception e) {
@@ -141,20 +144,26 @@ public class MarketDataConsumerService {
             return;
         }
 
+        // Broadcast raw tick event to live stream
+        auditStorageService.broadcastEvent(TradingEvent.fromTick(tick));
+
         // 1. Strict Input Validation
         String validationError = validateTick(tick);
         if (validationError != null) {
             log.warn("[Input Validation Rejected] Invalid tick: {} - Error: {}", rawMessage, validationError);
-            publishRejectionDurable(RiskRejection.create(
-                    tick.portfolioId(), tick.symbol(), tick.volume(), tick.price(), 0.0, validationError));
+            RiskRejection rejection = RiskRejection.create(
+                    tick.portfolioId(), tick.symbol(), tick.volume(), tick.price(), 0.0, validationError);
+            publishRejectionDurable(rejection);
+            auditStorageService.recordDecision(DecisionAuditRecord.create(
+                    "INVALID:" + System.nanoTime(), tick.portfolioId(), tick.symbol(), tick.price(),
+                    tick.volume(), 0.0, "REJECTED_VALIDATION", validationError, 0));
             return;
         }
 
         // 2. Check Idempotency Guard (Deduplication on Replay)
-        // NOTE: We only CHECK here. We do NOT add to cache yet!
         String tickFingerprint = tick.symbol() + ":" + tick.price() + ":" + tick.timestamp() + ":" + tick.volume();
         synchronized (processedTicksCache) {
-            if (processedTicksCache.contains(tickFingerprint)) {
+            if (processedTicksCache.contains(tickFingerprint) || auditStorageService.isFingerprintProcessed(tickFingerprint)) {
                 log.info("[Duplicate Tick Skipped] Idempotency guard detected replayed tick for {}", tickFingerprint);
                 return;
             }
@@ -180,9 +189,13 @@ public class MarketDataConsumerService {
 
             if (!permitAcquired) {
                 log.error("[Overload Policy - Trade REJECTED] Concurrency limit exhausted! Cannot dispatch risk evaluation for {}", tick.symbol());
-                publishRejectionDurable(RiskRejection.create(
+                RiskRejection rejection = RiskRejection.create(
                         tick.portfolioId(), tick.symbol(), proposedTradeSize, tick.price(), 0.0,
-                        "OVERLOAD_CONCURRENCY_LIMIT_EXCEEDED"));
+                        "OVERLOAD_CONCURRENCY_LIMIT_EXCEEDED");
+                publishRejectionDurable(rejection);
+                auditStorageService.recordDecision(DecisionAuditRecord.create(
+                        tickFingerprint, tick.portfolioId(), tick.symbol(), tick.price(),
+                        proposedTradeSize, 0.0, "REJECTED_OVERLOAD", "OVERLOAD_CONCURRENCY_LIMIT_EXCEEDED", 0));
                 return;
             }
 
@@ -207,6 +220,12 @@ public class MarketDataConsumerService {
                     );
 
                     publishOrderDurable(approvedOrder);
+                    auditStorageService.recordOrder(approvedOrder);
+                    auditStorageService.recordDecision(DecisionAuditRecord.create(
+                            tickFingerprint, tick.portfolioId(), tick.symbol(), tick.price(),
+                            proposedTradeSize, riskResponse.getValueAtRisk(), "APPROVED", "RISK_APPROVED",
+                            riskResponse.getComputationTimeMs()));
+
                     log.info("[Trade APPROVED & DURABLY RECORDED] Order: {} | Symbol: {} | VaR: {:.2f} | Latency: {}ms",
                             approvedOrder.orderId(), tick.symbol(), riskResponse.getValueAtRisk(), riskResponse.getComputationTimeMs());
 
@@ -222,6 +241,11 @@ public class MarketDataConsumerService {
                     );
 
                     publishRejectionDurable(rejection);
+                    auditStorageService.recordDecision(DecisionAuditRecord.create(
+                            tickFingerprint, tick.portfolioId(), tick.symbol(), tick.price(),
+                            proposedTradeSize, riskResponse.getValueAtRisk(), "REJECTED_VAR_EXCEEDED",
+                            "RISK_TOLERANCE_BREACH_VAR_EXCEEDED", riskResponse.getComputationTimeMs()));
+
                     log.warn("[Trade REJECTED & DURABLY RECORDED] Risk tolerance breach for Symbol: {}, VaR: {:.2f}",
                             tick.symbol(), riskResponse.getValueAtRisk());
                 }
@@ -254,10 +278,6 @@ public class MarketDataConsumerService {
         return null;
     }
 
-    /**
-     * Publishes approved order and synchronously waits for broker confirmation.
-     * Propagates exceptions on broker failure so offsets are not acknowledged.
-     */
     private void publishOrderDurable(Order order) {
         try {
             String json = objectMapper.writeValueAsString(order);
@@ -269,15 +289,12 @@ public class MarketDataConsumerService {
         }
     }
 
-    /**
-     * Publishes risk rejection and synchronously waits for broker confirmation.
-     * Propagates exceptions on broker failure so offsets are not acknowledged.
-     */
     private void publishRejectionDurable(RiskRejection rejection) {
         try {
             String json = objectMapper.writeValueAsString(rejection);
             kafkaTemplate.send(riskRejectionsTopic, rejection.symbol(), json)
                     .get(publishTimeoutMs, TimeUnit.MILLISECONDS);
+            auditStorageService.broadcastEvent(TradingEvent.fromRejection(rejection));
         } catch (Exception e) {
             log.error("CRITICAL: Failed to durably publish rejection {} to Kafka: {}", rejection.rejectionId(), e.getMessage(), e);
             throw new RuntimeException("Durable rejection publication failed for " + rejection.rejectionId(), e);
