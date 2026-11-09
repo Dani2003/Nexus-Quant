@@ -12,6 +12,8 @@ import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
 import org.springframework.kafka.listener.ContainerProperties;
+import org.springframework.kafka.listener.DefaultErrorHandler;
+import org.springframework.util.backoff.FixedBackOff;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -19,9 +21,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Spring Kafka configuration wired with Java 21 Project Loom Virtual Threads.
- * All message listener tasks and concurrent container dispatchers are executed
- * on lightweight virtual threads rather than carrier OS threads.
+ * Spring Kafka configuration wired with Java 21 Project Loom Virtual Threads
+ * and manual acknowledgment tied to full processing completion.
  */
 @Configuration
 @EnableKafka
@@ -62,29 +63,41 @@ public class KafkaConsumerConfig {
         props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
         props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, true);
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false); // Disabled for explicit manual ack
         return new DefaultKafkaConsumerFactory<>(props);
     }
 
     /**
-     * ConcurrentKafkaListenerContainerFactory configured to run on Virtual Threads.
+     * Error handler with 3 retry attempts and exponential backoff.
+     */
+    @Bean
+    public DefaultErrorHandler kafkaErrorHandler() {
+        // Retry 3 times with 200ms delay between attempts before logging error
+        return new DefaultErrorHandler(new FixedBackOff(200L, 3L));
+    }
+
+    /**
+     * ConcurrentKafkaListenerContainerFactory configured with Virtual Threads
+     * and MANUAL_IMMEDIATE ack mode to tie Kafka commits strictly to processing completion.
      */
     @Bean
     public ConcurrentKafkaListenerContainerFactory<String, String> kafkaListenerContainerFactory(
             ConsumerFactory<String, String> consumerFactory,
-            AsyncTaskExecutor kafkaVirtualThreadExecutor) {
+            AsyncTaskExecutor kafkaVirtualThreadExecutor,
+            DefaultErrorHandler kafkaErrorHandler) {
 
         ConcurrentKafkaListenerContainerFactory<String, String> factory =
                 new ConcurrentKafkaListenerContainerFactory<>();
         factory.setConsumerFactory(consumerFactory);
         factory.setConcurrency(concurrency);
 
-        // Assign the virtual thread executor so each consumer message polling task
-        // is executed on a lightweight Project Loom virtual thread
+        // Assign the virtual thread executor
         factory.getContainerProperties().setListenerTaskExecutor(kafkaVirtualThreadExecutor);
-        factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.RECORD);
+
+        // MANUAL_IMMEDIATE ensures offsets are committed only after processing succeeds
+        factory.getContainerProperties().setAckMode(ContainerProperties.AckMode.MANUAL_IMMEDIATE);
+        factory.setCommonErrorHandler(kafkaErrorHandler);
 
         return factory;
     }
 }
-

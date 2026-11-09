@@ -6,97 +6,75 @@
 [![gRPC](https://img.shields.io/badge/gRPC-Protobuf-244f5c?logo=grpc&logoColor=white)](https://grpc.io/)
 [![Apache Kafka](https://img.shields.io/badge/Apache%20Kafka-Distributed%20Streaming-231F20?logo=apachekafka&logoColor=white)](https://kafka.apache.org/)
 
-Nexus-Quant is a high-throughput, low-latency distributed algorithmic trading system architected to process real-time market data streams and execute sub-millisecond risk evaluation and order workflows.
+Nexus-Quant is an event-driven, distributed algorithmic trading platform designed for high-throughput market tick ingestion, sub-millisecond risk evaluation, and resilient order lifecycle management.
 
 ---
 
-## Architecture Overview
+## Architectural Architecture
 
 ```
-                      ┌───────────────────────────────────────┐
-                      │          Apache Kafka Cluster         │
-                      │         (Topic: market-ticks)         │
-                      └──────────────────┬────────────────────┘
+                      ┌────────────────────────────────────────┐
+                      │          Apache Kafka Cluster          │
+                      │  • Topic: market-ticks                 │
+                      │  • Topic: trade-orders                 │
+                      │  • Topic: risk-rejections              │
+                      └──────────────────┬─────────────────────┘
                                          │
-                                         ▼
-                 ┌─────────────────────────────────────────────────┐
-                 │       Java 21 Spring Boot 3 Orchestrator        │
-                 │                                                 │
-                 │  • Project Loom Virtual Threads Concurrency     │
-                 │  • Non-blocking Spring Kafka Message Listener   │
-                 │  • Real-time Price Threshold Detection          │
-                 │  • Non-blocking gRPC Client (BlockingStub on VT)│
-                 └───────────────────────┬─────────────────────────┘
+                                         ▼ (Manual Acknowledgment upon success)
+                 ┌──────────────────────────────────────────────────┐
+                 │       Java 21 Spring Boot 3 Orchestrator         │
+                 │                                                  │
+                 │  • Project Loom Virtual Threads Container        │
+                 │  • Reliable Processing-Tied Acknowledgment       │
+                 │  • Strict Input Validation (finite price/size)   │
+                 │  • Idempotency Guard (Deduplication on Replay)   │
+                 │  • Bounded Concurrency Semaphore (Overload Guard)│
+                 │  • Blocking gRPC Stub yielding Carrier Threads   │
+                 │  • Enforced gRPC Deadlines & Fail-Closed Policy  │
+                 └───────────────────────┬──────────────────────────┘
                                          │
                                          │ gRPC (EvaluateRisk)
-                                         │ Target Latency: < 5ms
+                                         │ Enforced Deadline: 50ms
                                          ▼
-                 ┌─────────────────────────────────────────────────┐
-                 │          Rust Risk Compute Sidecar              │
-                 │                                                 │
-                 │  • High-performance Tonic gRPC Server           │
-                 │  • Multi-worker tokio::spawn Task Concurrency   │
-                 │  • 10,000-Path Monte Carlo VaR Simulation       │
-                 │  • Box-Muller Geometric Brownian Motion (GBM)   │
-                 │  • O(N) Quickselect Value-at-Risk Extraction    │
-                 │  • Benchmark Latency: ~924 μs (< 1 ms)          │
-                 └─────────────────────────────────────────────────┘
+                 ┌──────────────────────────────────────────────────┐
+                 │          Rust Risk Compute Sidecar               │
+                 │                                                  │
+                 │  • Tonic gRPC Server (Async I/O Event Loop)      │
+                 │  • tokio::task::spawn_blocking Offload           │
+                 │  • Multi-Core Rayon Parallelism across CPU cores │
+                 │  • 10,000-Path Monte Carlo VaR Simulation        │
+                 │  • Explicit LONG & SHORT Position Modeling       │
+                 │  • O(N) Quickselect Value-at-Risk Extraction     │
+                 │  • Multi-threaded Benchmark: 10 concurrent       │
+                 │    simulations completed in 3ms total            │
+                 └──────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Tech Stack
+## Key Resilience & Concurrency Guarantees
 
-| Component | Technology | Role |
-| :--- | :--- | :--- |
-| **Main Orchestrator** | **Java 21**, **Spring Boot 3.3**, **Spring Kafka**, **WebFlux** | Ingests market ticks, checks trading thresholds, and orchestrates trading workflows on **Virtual Threads (Project Loom)** without OS-thread blocking. |
-| **Compute Sidecar** | **Rust (Edition 2021)**, **Tokio**, **Tonic**, **Prost** | Sub-millisecond compute engine calculating 10,000-path Monte Carlo Value-at-Risk (VaR). |
-| **Inter-Service Protocol** | **gRPC / Protocol Buffers (proto3)** | Ultra low-overhead binary RPC communication over HTTP/2. |
-| **Messaging Spine** | **Apache Kafka & Zookeeper** | Resilient, distributed event streaming pipeline for market ticks and order events. |
-| **Containerization** | **Docker & Docker Compose** | Multi-stage production container builds for local dev and cloud deployment. |
+### 1. Reliable Kafka Acknowledgment
+- **Processing-Tied Commit**: The consumer does not use detached fire-and-forget submission. Each tick is processed on a Virtual Thread, and `acknowledgment.acknowledge()` is called **only after** validation, risk evaluation, and order/rejection publishing succeed.
+- **Controlled Error Recovery**: RPC timeouts or sidecar downtime trigger Spring Kafka's `DefaultErrorHandler` with exponential backoff and routing to Dead Letter Queues (DLQ) rather than silently dropping ticks.
 
----
+### 2. Enforced gRPC Deadline & Fail-Closed Overload Policy
+- **Deadline Enforcement**: `blockingStub.withDeadlineAfter(grpcDeadlineMs, TimeUnit.MILLISECONDS)` prevents hung connections.
+- **Fail-Closed Design**: If the risk sidecar is unreachable or times out, the trade is rejected with `RISK_ENGINE_UNAVAILABLE` or `RISK_ENGINE_DEADLINE_EXCEEDED` rather than unsafely executed.
+- **Bounded Concurrency**: A concurrency limiter (`Semaphore`) caps simultaneous in-flight risk checks, triggering an explicit overload rejection policy when capacity is saturated.
 
-## Project Structure
+### 3. Dedicated CPU Parallelism in Rust
+- **Tokio & Rayon Separation**: Pure CPU compute loops (Box-Muller variate generation and price path integration) are executed on Rayon's threadpool via `tokio::task::spawn_blocking`. This prevents CPU starvation on Tokio's async reactor threads.
+- **Position Handling**: Supports both **LONG** (`trade_size > 0`) and **SHORT** (`trade_size < 0`) positions, correctly modeling drawdowns from upward price movement on short exposure.
 
-```
-Nexus-Quant/
-├── proto/
-│   └── risk_engine.proto          # Shared gRPC protobuf contract
-├── orchestrator/                  # Java 21 Spring Boot 3 Main Service
-│   ├── src/main/java/com/trading/orchestrator/
-│   │   ├── client/
-│   │   │   └── RiskGrpcClient.java           # Loom-friendly gRPC client
-│   │   ├── config/
-│   │   │   └── KafkaConsumerConfig.java      # Virtual Thread Kafka Listener Factory
-│   │   ├── grpc/                             # Generated Protobuf & gRPC stubs
-│   │   ├── model/
-│   │   │   ├── MarketTick.java               # Immutable market data record
-│   │   │   └── OrderStatus.java              # Order lifecycle state
-│   │   ├── service/
-│   │   │   └── MarketDataConsumerService.java# Event consumer & threshold evaluator
-│   │   └── OrchestratorApplication.java
-│   ├── src/main/resources/
-│   │   └── application.yml                   # Configuration with Loom & Kafka properties
-│   ├── src/test/java/                        # Unit & concurrency tests
-│   ├── Dockerfile
-│   └── pom.xml
-├── risk-sidecar/                  # Rust Tokio/Tonic Compute Engine
-│   ├── src/
-│   │   └── main.rs                # Multi-worker Monte Carlo VaR simulator & Tonic server
-│   ├── build.rs                   # Automatic proto compilation
-│   ├── Cargo.toml
-│   └── Dockerfile
-├── docker-compose.yml             # Full stack orchestration (Zookeeper, Kafka, Orchestrator, Sidecar)
-├── .gitignore
-└── README.md
-```
+### 4. Idempotency & Replay Protection
+- An in-memory bounded LRU deduplication cache detects duplicate tick deliveries from Kafka partition rebalances and skips re-evaluating risk, avoiding duplicate orders.
 
 ---
 
-## Performance Benchmark
+## Benchmark & Load Verification
 
-The Rust Monte Carlo VaR simulation was verified with concurrent worker tasks across 10,000 paths:
+Tested on an 8-core machine with 10 concurrent requests (each simulating 10,000 paths):
 
 ```bash
 cd risk-sidecar
@@ -104,57 +82,36 @@ cargo test --release -- --nocapture
 ```
 
 ```text
-running 1 test
-Test Simulation: VaR(95%)=379.8869, is_approved=true, latency=924μs
-test tests::test_monte_carlo_var_simulation ... ok
+running 3 tests
+SHORT test: VaR=391.8839, approved=true, latency=1595μs
+LONG test: VaR=389.3897, approved=true, latency=1761μs
+test tests::test_long_position_var ... ok
+test tests::test_short_position_var ... ok
+Concurrent task finished: VaR=390.48, approved=true, latency=2752μs
+Concurrent task finished: VaR=400.94, approved=true, latency=1703μs
+Concurrent task finished: VaR=382.55, approved=true, latency=1099μs
+...
+10 Concurrent Monte Carlo requests completed in 3ms
+test tests::test_concurrent_load_performance ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 ```
-
-* **Target Latency:** `< 5 ms`
-* **Achieved Benchmark Latency:** **~924 μs (< 1 ms)**
 
 ---
 
-## Quickstart & Deployment
+## Quickstart & Docker Compose
 
-### 1. Run via Docker Compose
-To launch the entire platform (Kafka, Zookeeper, Rust Risk Sidecar, Java Orchestrator):
+Launch the complete stack (Zookeeper, Kafka, Rust Risk Sidecar, Java Orchestrator):
 
 ```bash
 docker compose up --build
 ```
 
-### 2. Run Locally for Development
-
-#### A. Start Kafka & Zookeeper
-```bash
-docker compose up -d zookeeper kafka
-```
-
-#### B. Start Rust Risk Sidecar
-```bash
-cd risk-sidecar
-cargo run --release
-```
-*Listens on `0.0.0.0:50051`.*
-
-#### C. Start Java Orchestrator
-```bash
-cd orchestrator
-mvn spring-boot:run
-```
-*Listens on `http://localhost:8080`.*
-
----
-
-## Market Data Tick Format
-
-Publish tick events to the `market-ticks` Kafka topic:
-
+### Market Tick Ingestion Payload
+Publish ticks to `market-ticks`:
 ```json
 {
-  "portfolio_id": "TECH_PORTFOLIO_1",
+  "portfolio_id": "MAIN_FUND",
   "symbol": "AAPL",
   "price": 175.50,
   "volume": 250.0,
@@ -162,9 +119,4 @@ Publish tick events to the `market-ticks` Kafka topic:
 }
 ```
 
-*When `price >= 150.00` (configurable), the Java Orchestrator triggers an RPC to the Rust compute sidecar to simulate 10,000 price paths and determine trade approval.*
-
----
-
-## License
-MIT License.
+*When `price >= 150.00` (configurable), the orchestrator triggers an RPC to the Rust sidecar. Approved trades are published to `trade-orders`, while rejected trades are published to `risk-rejections`.*

@@ -9,16 +9,20 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.support.Acknowledgment;
 
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyDouble;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -28,28 +32,36 @@ class MarketDataConsumerServiceTest {
     @Mock
     private RiskGrpcClient riskGrpcClient;
 
-    private ExecutorService virtualThreadExecutor;
+    @Mock
+    private KafkaTemplate<String, String> kafkaTemplate;
+
+    @Mock
+    private Acknowledgment acknowledgment;
+
     private MarketDataConsumerService consumerService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     @BeforeEach
     void setUp() {
-        virtualThreadExecutor = Executors.newVirtualThreadPerTaskExecutor();
         consumerService = new MarketDataConsumerService(
                 riskGrpcClient,
                 objectMapper,
-                virtualThreadExecutor,
+                kafkaTemplate,
                 150.0,
-                100.0
+                100.0,
+                "trade-orders",
+                "risk-rejections",
+                50,
+                25L
         );
     }
 
     @Test
-    @DisplayName("Should trigger gRPC RiskRequest on Virtual Thread when tick price exceeds threshold")
-    void shouldTriggerRiskRequestWhenThresholdMet() throws Exception {
+    @DisplayName("Should validate tick, trigger gRPC RiskRequest, publish Order, and acknowledge Kafka offset")
+    void shouldProcessValidTickAndAcknowledge() throws Exception {
         String jsonTick = """
             {
-                "portfolio_id": "TECH_FUND_1",
+                "portfolio_id": "GROWTH_1",
                 "symbol": "AAPL",
                 "price": 175.50,
                 "volume": 250.0,
@@ -57,48 +69,82 @@ class MarketDataConsumerServiceTest {
             }
             """;
 
-        RiskResponse mockResponse = RiskResponse.newBuilder()
+        RiskResponse approvedResponse = RiskResponse.newBuilder()
                 .setIsApproved(true)
                 .setValueAtRisk(450.25)
-                .setComputationTimeMs(2)
+                .setComputationTimeMs(1)
                 .build();
 
-        when(riskGrpcClient.evaluateRisk(eq("TECH_FUND_1"), eq("AAPL"), eq(250.0), eq(175.50)))
-                .thenReturn(mockResponse);
+        when(riskGrpcClient.evaluateRisk(eq("GROWTH_1"), eq("AAPL"), eq(250.0), eq(175.50)))
+                .thenReturn(approvedResponse);
 
         CountDownLatch latch = new CountDownLatch(1);
-        Thread.ofVirtual().name("test-vt").start(() -> {
-            consumerService.processTick(jsonTick);
+        Thread.ofVirtual().start(() -> {
+            consumerService.onMarketTick(jsonTick, "market-ticks", 0, 100L, acknowledgment);
             latch.countDown();
         });
 
         assertTrue(latch.await(3, TimeUnit.SECONDS));
 
-        verify(riskGrpcClient).evaluateRisk("TECH_FUND_1", "AAPL", 250.0, 175.50);
+        // Verify risk evaluated
+        verify(riskGrpcClient).evaluateRisk("GROWTH_1", "AAPL", 250.0, 175.50);
+        // Verify approved order published to trade-orders topic
+        verify(kafkaTemplate).send(eq("trade-orders"), eq("AAPL"), contains("\"status\":\"APPROVED\""));
+        // Verify Kafka offset acknowledged ONLY after success
+        verify(acknowledgment).acknowledge();
     }
 
     @Test
-    @DisplayName("Should NOT trigger gRPC RiskRequest when tick price is below threshold")
-    void shouldNotTriggerRiskRequestWhenBelowThreshold() throws Exception {
-        String jsonTick = """
+    @DisplayName("Should reject invalid non-finite price without calling gRPC sidecar")
+    void shouldRejectInvalidPrice() throws Exception {
+        String invalidTick = """
             {
-                "portfolio_id": "TECH_FUND_1",
+                "portfolio_id": "GROWTH_1",
                 "symbol": "AAPL",
-                "price": 120.00,
+                "price": -50.0,
                 "volume": 100.0,
-                "timestamp": 1715000000000
+                "timestamp": 1715000001000
             }
             """;
 
-        CountDownLatch latch = new CountDownLatch(1);
-        Thread.ofVirtual().name("test-vt").start(() -> {
-            consumerService.processTick(jsonTick);
-            latch.countDown();
-        });
+        consumerService.onMarketTick(invalidTick, "market-ticks", 0, 101L, acknowledgment);
 
-        assertTrue(latch.await(3, TimeUnit.SECONDS));
+        verify(riskGrpcClient, never()).evaluateRisk(anyString(), anyString(), anyDouble(), anyDouble());
+        verify(kafkaTemplate).send(eq("risk-rejections"), eq("AAPL"), contains("INVALID_PRICE"));
+        verify(acknowledgment).acknowledge();
+    }
 
-        verify(riskGrpcClient, never()).evaluateRisk(eq("TECH_FUND_1"), eq("AAPL"), anyDouble(), anyDouble());
+    @Test
+    @DisplayName("Should detect and drop replayed duplicate tick via idempotency guard")
+    void shouldDropDuplicateTicks() throws Exception {
+        String jsonTick = """
+            {
+                "portfolio_id": "GROWTH_1",
+                "symbol": "MSFT",
+                "price": 180.00,
+                "volume": 50.0,
+                "timestamp": 1715000002000
+            }
+            """;
+
+        RiskResponse approvedResponse = RiskResponse.newBuilder()
+                .setIsApproved(true)
+                .setValueAtRisk(120.0)
+                .setComputationTimeMs(1)
+                .build();
+
+        when(riskGrpcClient.evaluateRisk(anyString(), eq("MSFT"), anyDouble(), anyDouble()))
+                .thenReturn(approvedResponse);
+
+        // First delivery
+        consumerService.onMarketTick(jsonTick, "market-ticks", 0, 102L, acknowledgment);
+        // Second delivery (e.g. partition rebalance replay)
+        consumerService.onMarketTick(jsonTick, "market-ticks", 0, 102L, acknowledgment);
+
+        // Risk check and Order publishing should only execute ONCE
+        verify(riskGrpcClient, times(1)).evaluateRisk(anyString(), eq("MSFT"), anyDouble(), anyDouble());
+        verify(kafkaTemplate, times(1)).send(eq("trade-orders"), eq("MSFT"), anyString());
+        // Both invocations acknowledge so Kafka does not hang
+        verify(acknowledgment, times(2)).acknowledge();
     }
 }
-
