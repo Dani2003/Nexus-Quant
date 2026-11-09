@@ -22,7 +22,6 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -43,6 +42,7 @@ class OrderExecutionConsumerServiceTest {
 
     private AuditStorageService auditStorageService;
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private OrderExecutionTransactionService transactionService;
     private OrderExecutionConsumerService consumerService;
 
     @BeforeEach
@@ -51,7 +51,7 @@ class OrderExecutionConsumerServiceTest {
                 .thenReturn(CompletableFuture.completedFuture(null));
 
         auditStorageService = new AuditStorageService();
-        consumerService = new OrderExecutionConsumerService(
+        transactionService = new OrderExecutionTransactionService(
                 objectMapper,
                 kafkaTemplate,
                 auditStorageService,
@@ -60,11 +60,12 @@ class OrderExecutionConsumerServiceTest {
                 "trade-executions",
                 3000L
         );
+        consumerService = new OrderExecutionConsumerService(objectMapper, transactionService);
     }
 
     @Test
-    @DisplayName("Should execute valid trade order and apply fill to portfolio")
-    void shouldExecuteOrderAndApplyFill() throws Exception {
+    @DisplayName("Should execute valid trade order and acknowledge Kafka only after transaction completes")
+    void shouldExecuteOrderAndAcknowledge() throws Exception {
         Order order = new Order("ord-101", "PORT_1", "NVDA", "BUY", 100.0, 150.0, OrderStatus.APPROVED, 50.0, System.currentTimeMillis());
         String orderJson = objectMapper.writeValueAsString(order);
 
@@ -72,14 +73,14 @@ class OrderExecutionConsumerServiceTest {
 
         consumerService.onTradeOrder(orderJson, acknowledgment);
 
-        verify(executionRecordRepository).save(any(ExecutionRecordEntity.class));
+        verify(executionRecordRepository).saveAndFlush(any(ExecutionRecordEntity.class));
         verify(kafkaTemplate).send(eq("trade-executions"), eq("NVDA"), anyString());
         verify(portfolioService).applyExecution(any(ExecutionReport.class));
         verify(acknowledgment).acknowledge();
     }
 
     @Test
-    @DisplayName("Should skip duplicate order execution on Kafka replay without re-applying fill")
+    @DisplayName("Should skip duplicate order execution without re-applying fill and acknowledge offset")
     void shouldSkipDuplicateOrderExecutionOnReplay() throws Exception {
         Order order = new Order("ord-102", "PORT_1", "NVDA", "BUY", 100.0, 150.0, OrderStatus.APPROVED, 50.0, System.currentTimeMillis());
         String orderJson = objectMapper.writeValueAsString(order);
@@ -90,12 +91,11 @@ class OrderExecutionConsumerServiceTest {
         consumerService.onTradeOrder(orderJson, acknowledgment);
 
         // Verify fill was NOT applied again and NO new report published
-        verify(executionRecordRepository, never()).save(any(ExecutionRecordEntity.class));
+        verify(executionRecordRepository, never()).saveAndFlush(any(ExecutionRecordEntity.class));
         verify(portfolioService, never()).applyExecution(any(ExecutionReport.class));
         verify(kafkaTemplate, never()).send(anyString(), anyString(), anyString());
 
-        // Offset acknowledged so Kafka doesn't hang
+        // Offset acknowledged so Kafka does not hang
         verify(acknowledgment).acknowledge();
     }
 }
-

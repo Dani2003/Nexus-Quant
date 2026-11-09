@@ -32,8 +32,9 @@ import java.util.concurrent.TimeUnit;
  *  1. Atomic conditional idempotency claims across concurrent workers and restarts.
  *  2. Relational persistence of risk decisions and trade orders.
  *  3. Outbox event recording in the same DB transaction, eliminating dual-write inconsistencies.
- *  4. Synchronous immediate publishing with guaranteed background recovery poller.
- *  5. Multi-instance coordination via atomic state transition claims.
+ *  4. Immediate send paths create events in IN_FLIGHT status, completely preventing races with the poller.
+ *  5. Lease expiry and recovery for stale IN_FLIGHT events ensuring zero stranded events.
+ *  6. Multi-instance coordination via atomic state transition claims.
  */
 @Service
 public class TransactionalOutboxService {
@@ -117,7 +118,8 @@ public class TransactionalOutboxService {
 
     /**
      * Atomically writes an approved trade order, its risk decision record,
-     * the outbox message, and marks the claim as COMPLETED.
+     * the outbox message (initialized as IN_FLIGHT to prevent race with poller),
+     * and marks the claim as COMPLETED.
      */
     @Transactional
     public OutboxEventEntity recordApprovedOrder(
@@ -156,13 +158,14 @@ public class TransactionalOutboxService {
         );
         tradeOrderRepository.save(orderEntity);
 
-        // 3. Outbox Event
+        // 3. Outbox Event (status = IN_FLIGHT prevents scheduled poller from racing the immediate send)
         String payload = objectMapper.writeValueAsString(order);
         OutboxEventEntity outboxEvent = new OutboxEventEntity(
                 UUID.randomUUID().toString(),
                 tradeOrdersTopic,
                 order.symbol(),
-                payload
+                payload,
+                "IN_FLIGHT"
         );
         outboxEventRepository.save(outboxEvent);
 
@@ -177,7 +180,7 @@ public class TransactionalOutboxService {
 
     /**
      * Atomically writes a risk rejection, its decision audit record,
-     * the outbox message, and marks the claim as COMPLETED.
+     * the outbox message (initialized as IN_FLIGHT), and marks the claim as COMPLETED.
      */
     @Transactional
     public OutboxEventEntity recordRejection(
@@ -207,7 +210,8 @@ public class TransactionalOutboxService {
                 UUID.randomUUID().toString(),
                 riskRejectionsTopic,
                 rejection.symbol(),
-                payload
+                payload,
+                "IN_FLIGHT"
         );
         outboxEventRepository.save(outboxEvent);
 
@@ -231,7 +235,9 @@ public class TransactionalOutboxService {
     }
 
     /**
-     * Publishes an outbox event to Kafka and marks it SENT on confirmation.
+     * Publishes an outbox event immediately to Kafka.
+     * If broker publication fails, safely demotes status from IN_FLIGHT to PENDING
+     * so that the background recovery poller can pick it up.
      */
     public void publishOutboxEventNow(OutboxEventEntity outboxEvent, long publishTimeoutMs) {
         try {
@@ -239,8 +245,9 @@ public class TransactionalOutboxService {
                     .get(publishTimeoutMs, TimeUnit.MILLISECONDS);
             markOutboxEventSent(outboxEvent.getEventId());
         } catch (Exception e) {
-            log.error("[Outbox Error] Immediate publish failed for event {}: {}. Will be recovered by poller.",
+            log.error("[Outbox Error] Immediate publish failed for event {}: {}. Reverting to PENDING for poller retry.",
                     outboxEvent.getEventId(), e.getMessage());
+            demoteToPending(outboxEvent.getEventId());
             throw new RuntimeException("Immediate publish failed for outbox event " + outboxEvent.getEventId(), e);
         }
     }
@@ -254,20 +261,34 @@ public class TransactionalOutboxService {
         });
     }
 
+    @Transactional
+    public void demoteToPending(String eventId) {
+        outboxEventRepository.findById(eventId).ifPresent(e -> {
+            e.setStatus("PENDING");
+            outboxEventRepository.save(e);
+        });
+    }
+
     /**
-     * Background outbox recovery poller ensuring at-least-once delivery
-     * even across abrupt process crashes. Uses atomic claim to coordinate safely across replicas.
+     * Background outbox recovery poller.
+     * Scans for both PENDING events and stale IN_FLIGHT events (lease > 30s) to guarantee
+     * zero stranded events across node crashes or transient network partitions.
      */
     @Scheduled(fixedDelay = 5000)
     @Transactional
     public void processPendingOutboxEvents() {
         try {
-            List<OutboxEventEntity> pending = outboxEventRepository.findByStatusOrderByCreatedAtAsc("PENDING", PageRequest.of(0, 50));
-            for (OutboxEventEntity event : pending) {
-                // Multi-instance atomic claim: transitions PENDING -> IN_FLIGHT
-                int claimed = outboxEventRepository.claimOutboxEvent(event.getEventId());
+            long now = System.currentTimeMillis();
+            long staleThreshold = now - 30_000; // 30-second lease expiration for stranded in-flight events
+
+            List<OutboxEventEntity> pendingOrStale = outboxEventRepository.findPendingOrStaleInFlight(
+                    staleThreshold, PageRequest.of(0, 50));
+
+            for (OutboxEventEntity event : pendingOrStale) {
+                // Multi-instance atomic claim with lease renewal
+                int claimed = outboxEventRepository.claimOutboxEventWithLease(event.getEventId(), now, staleThreshold);
                 if (claimed == 0) {
-                    continue; // Another instance already claimed this event
+                    continue; // Another instance claimed this event
                 }
 
                 try {
@@ -276,10 +297,9 @@ public class TransactionalOutboxService {
                     markOutboxEventSent(event.getEventId());
                     log.info("[Outbox Poller] Successfully recovered and published event {}", event.getEventId());
                 } catch (Exception e) {
-                    log.warn("[Outbox Poller] Could not deliver claimed event {}: {}", event.getEventId(), e.getMessage());
-                    // Revert to PENDING so future runs can retry
-                    event.setStatus("PENDING");
-                    outboxEventRepository.save(event);
+                    log.warn("[Outbox Poller] Could not deliver claimed event {}: {}. Returning to PENDING.",
+                            event.getEventId(), e.getMessage());
+                    demoteToPending(event.getEventId());
                 }
             }
         } catch (Exception e) {

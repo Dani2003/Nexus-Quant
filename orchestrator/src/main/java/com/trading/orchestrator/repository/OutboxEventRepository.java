@@ -11,13 +11,23 @@ import org.springframework.stereotype.Repository;
 import java.util.List;
 
 /**
- * Durable repository for outbox events supporting safe multi-instance coordination and status queries.
+ * Durable repository for outbox events supporting safe multi-instance coordination,
+ * stale lease reclamation, and status queries.
  */
 @Repository
 public interface OutboxEventRepository extends JpaRepository<OutboxEventEntity, String> {
+
     List<OutboxEventEntity> findByStatusOrderByCreatedAtAsc(String status, Pageable pageable);
 
+    @Query("SELECT e FROM OutboxEventEntity e WHERE e.status = 'PENDING' OR (e.status = 'IN_FLIGHT' AND e.updatedAt < :staleThreshold) ORDER BY e.createdAt ASC")
+    List<OutboxEventEntity> findPendingOrStaleInFlight(@Param("staleThreshold") long staleThreshold, Pageable pageable);
+
     @Modifying
-    @Query("UPDATE OutboxEventEntity e SET e.status = 'IN_FLIGHT' WHERE e.eventId = :eventId AND e.status = 'PENDING'")
-    int claimOutboxEvent(@Param("eventId") String eventId);
+    @Query("UPDATE OutboxEventEntity e SET e.status = 'IN_FLIGHT', e.updatedAt = :now, e.retryCount = e.retryCount + 1 " +
+           "WHERE e.eventId = :eventId AND (e.status = 'PENDING' OR (e.status = 'IN_FLIGHT' AND e.updatedAt < :staleThreshold))")
+    int claimOutboxEventWithLease(
+            @Param("eventId") String eventId,
+            @Param("now") long now,
+            @Param("staleThreshold") long staleThreshold
+    );
 }
