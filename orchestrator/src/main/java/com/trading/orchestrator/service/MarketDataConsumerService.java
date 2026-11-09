@@ -29,11 +29,11 @@ import java.util.concurrent.TimeUnit;
 /**
  * Event-Driven Kafka Consumer service that listens to the market-ticks topic.
  * Fully utilizes Java 21 Project Loom Virtual Threads with:
- *  1. Reliable acknowledgment tied strictly to processing completion.
+ *  1. Reliable acknowledgment tied strictly to processing completion and durable Kafka publication.
  *  2. Bounded concurrency & overload policy via Semaphore.
  *  3. Strict input validation rejecting invalid/non-finite prices.
- *  4. Idempotency guard preventing duplicate decisions from replayed ticks.
- *  5. Observable decision publishing for all approvals and rejections.
+ *  4. Idempotency guard cached ONLY after durable outcome recording.
+ *  5. Synchronous, verified publishing of orders and rejections to Kafka.
  */
 @Service
 public class MarketDataConsumerService {
@@ -48,11 +48,13 @@ public class MarketDataConsumerService {
     private final double defaultTradeSize;
     private final String tradeOrdersTopic;
     private final String riskRejectionsTopic;
+    private final long publishTimeoutMs;
 
     private final Semaphore concurrencyLimiter;
     private final long concurrencyTimeoutMs;
 
     // Bounded LRU cache for tick idempotency deduplication (capacity: 10,000)
+    // CRITICAL: Entries are inserted ONLY after processing and durable publication succeed.
     private final Set<String> processedTicksCache = Collections.newSetFromMap(
             new LinkedHashMap<String, Boolean>(10_000, 0.75f, true) {
                 @Override
@@ -70,6 +72,7 @@ public class MarketDataConsumerService {
             @Value("${trading.risk.default-proposed-trade-size:100.0}") double defaultTradeSize,
             @Value("${trading.kafka.trade-orders-topic:trade-orders}") String tradeOrdersTopic,
             @Value("${trading.kafka.risk-rejections-topic:risk-rejections}") String riskRejectionsTopic,
+            @Value("${trading.kafka.publish-timeout-ms:3000}") long publishTimeoutMs,
             @Value("${trading.risk.max-concurrent-evaluations:50}") int maxConcurrentEvaluations,
             @Value("${trading.risk.concurrency-timeout-ms:25}") long concurrencyTimeoutMs) {
 
@@ -80,6 +83,7 @@ public class MarketDataConsumerService {
         this.defaultTradeSize = defaultTradeSize;
         this.tradeOrdersTopic = tradeOrdersTopic;
         this.riskRejectionsTopic = riskRejectionsTopic;
+        this.publishTimeoutMs = publishTimeoutMs;
         this.concurrencyLimiter = new Semaphore(maxConcurrentEvaluations, true);
         this.concurrencyTimeoutMs = concurrencyTimeoutMs;
 
@@ -90,7 +94,7 @@ public class MarketDataConsumerService {
     /**
      * Kafka Listener for market data ticks.
      * Executed directly on Java 21 Virtual Threads and commits offsets ONLY after
-     * processing, validation, and risk evaluation succeed.
+     * processing, validation, risk evaluation, and output event publication succeed.
      */
     @KafkaListener(
             topics = "${trading.kafka.market-ticks-topic:market-ticks}",
@@ -106,21 +110,21 @@ public class MarketDataConsumerService {
         try {
             processTick(rawMessage);
 
-            // Tie acknowledgment to processing completion: commit only after success!
+            // Tie acknowledgment strictly to durable outcome completion
             if (acknowledgment != null) {
                 acknowledgment.acknowledge();
             }
 
         } catch (RiskServiceException e) {
-            log.error("[Risk Failure] RPC failed for tick from [{}-{}@{}]: {}. Routing to error handler for retry.",
+            log.error("[Risk Failure] RPC failed for tick from [{}-{}@{}]: {}. Propagating to Kafka error handler for retry.",
                     topic, partition, offset, e.getMessage());
             // Rethrow so Spring Kafka's retry and dead-letter handler can intervene deliberately
             throw e;
 
         } catch (Exception e) {
-            log.error("[Fatal Processing Error] Unexpected error processing tick from [{}-{}@{}]: {}",
+            log.error("[Processing Error] Failure processing tick from [{}-{}@{}]: {}. Triggering Kafka error handler.",
                     topic, partition, offset, e.getMessage(), e);
-            throw new RuntimeException("Tick processing error", e);
+            throw (e instanceof RuntimeException re) ? re : new RuntimeException("Tick processing error", e);
         }
     }
 
@@ -133,8 +137,7 @@ public class MarketDataConsumerService {
             tick = objectMapper.readValue(rawMessage, MarketTick.class);
         } catch (JsonProcessingException e) {
             log.error("[Deserialization Error] Dropping malformed JSON tick: {}", rawMessage, e);
-            // Non-recoverable format error; record rejection and do not crash consumer
-            publishRejection(RiskRejection.create("UNKNOWN", "UNKNOWN", 0.0, 0.0, 0.0, "MALFORMED_JSON_PAYLOAD"));
+            publishRejectionDurable(RiskRejection.create("UNKNOWN", "UNKNOWN", 0.0, 0.0, 0.0, "MALFORMED_JSON_PAYLOAD"));
             return;
         }
 
@@ -142,19 +145,19 @@ public class MarketDataConsumerService {
         String validationError = validateTick(tick);
         if (validationError != null) {
             log.warn("[Input Validation Rejected] Invalid tick: {} - Error: {}", rawMessage, validationError);
-            publishRejection(RiskRejection.create(
+            publishRejectionDurable(RiskRejection.create(
                     tick.portfolioId(), tick.symbol(), tick.volume(), tick.price(), 0.0, validationError));
             return;
         }
 
-        // 2. Idempotency Guard (Deduplication on Replay)
+        // 2. Check Idempotency Guard (Deduplication on Replay)
+        // NOTE: We only CHECK here. We do NOT add to cache yet!
         String tickFingerprint = tick.symbol() + ":" + tick.price() + ":" + tick.timestamp() + ":" + tick.volume();
         synchronized (processedTicksCache) {
             if (processedTicksCache.contains(tickFingerprint)) {
                 log.info("[Duplicate Tick Skipped] Idempotency guard detected replayed tick for {}", tickFingerprint);
                 return;
             }
-            processedTicksCache.add(tickFingerprint);
         }
 
         log.info("[Tick Ingested] Symbol: {}, Price: {:.2f}, Volume: {}, Thread: {}",
@@ -177,7 +180,7 @@ public class MarketDataConsumerService {
 
             if (!permitAcquired) {
                 log.error("[Overload Policy - Trade REJECTED] Concurrency limit exhausted! Cannot dispatch risk evaluation for {}", tick.symbol());
-                publishRejection(RiskRejection.create(
+                publishRejectionDurable(RiskRejection.create(
                         tick.portfolioId(), tick.symbol(), proposedTradeSize, tick.price(), 0.0,
                         "OVERLOAD_CONCURRENCY_LIMIT_EXCEEDED"));
                 return;
@@ -193,7 +196,7 @@ public class MarketDataConsumerService {
                 );
 
                 if (riskResponse.getIsApproved()) {
-                    // 5a. Publish Approved Order
+                    // 5a. Publish Approved Order DURABLY
                     Order approvedOrder = Order.createApproved(
                             tick.portfolioId(),
                             tick.symbol(),
@@ -203,12 +206,12 @@ public class MarketDataConsumerService {
                             riskResponse.getValueAtRisk()
                     );
 
-                    publishOrder(approvedOrder);
-                    log.info("[Trade APPROVED] Order: {} | Symbol: {} | VaR: {:.2f} | Latency: {}ms",
+                    publishOrderDurable(approvedOrder);
+                    log.info("[Trade APPROVED & DURABLY RECORDED] Order: {} | Symbol: {} | VaR: {:.2f} | Latency: {}ms",
                             approvedOrder.orderId(), tick.symbol(), riskResponse.getValueAtRisk(), riskResponse.getComputationTimeMs());
 
                 } else {
-                    // 5b. Publish Rejected Decision
+                    // 5b. Publish Rejected Decision DURABLY
                     RiskRejection rejection = RiskRejection.create(
                             tick.portfolioId(),
                             tick.symbol(),
@@ -218,8 +221,8 @@ public class MarketDataConsumerService {
                             "RISK_TOLERANCE_BREACH_VAR_EXCEEDED"
                     );
 
-                    publishRejection(rejection);
-                    log.warn("[Trade REJECTED] Risk tolerance breach for Symbol: {}, VaR: {:.2f}",
+                    publishRejectionDurable(rejection);
+                    log.warn("[Trade REJECTED & DURABLY RECORDED] Risk tolerance breach for Symbol: {}, VaR: {:.2f}",
                             tick.symbol(), riskResponse.getValueAtRisk());
                 }
 
@@ -230,6 +233,11 @@ public class MarketDataConsumerService {
         } else {
             log.debug("[Normal Flow] Symbol: {} price {:.2f} < threshold {:.2f}. Skipping risk evaluation.",
                     tick.symbol(), tick.price(), priceThreshold);
+        }
+
+        // 6. Record fingerprint into idempotency cache ONLY AFTER successful outcome recording
+        synchronized (processedTicksCache) {
+            processedTicksCache.add(tickFingerprint);
         }
     }
 
@@ -246,21 +254,33 @@ public class MarketDataConsumerService {
         return null;
     }
 
-    private void publishOrder(Order order) {
+    /**
+     * Publishes approved order and synchronously waits for broker confirmation.
+     * Propagates exceptions on broker failure so offsets are not acknowledged.
+     */
+    private void publishOrderDurable(Order order) {
         try {
             String json = objectMapper.writeValueAsString(order);
-            kafkaTemplate.send(tradeOrdersTopic, order.symbol(), json);
+            kafkaTemplate.send(tradeOrdersTopic, order.symbol(), json)
+                    .get(publishTimeoutMs, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
-            log.error("Failed to publish approved order to Kafka topic {}: {}", tradeOrdersTopic, e.getMessage(), e);
+            log.error("CRITICAL: Failed to durably publish approved order {} to Kafka: {}", order.orderId(), e.getMessage(), e);
+            throw new RuntimeException("Durable order publication failed for " + order.orderId(), e);
         }
     }
 
-    private void publishRejection(RiskRejection rejection) {
+    /**
+     * Publishes risk rejection and synchronously waits for broker confirmation.
+     * Propagates exceptions on broker failure so offsets are not acknowledged.
+     */
+    private void publishRejectionDurable(RiskRejection rejection) {
         try {
             String json = objectMapper.writeValueAsString(rejection);
-            kafkaTemplate.send(riskRejectionsTopic, rejection.symbol(), json);
+            kafkaTemplate.send(riskRejectionsTopic, rejection.symbol(), json)
+                    .get(publishTimeoutMs, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
-            log.error("Failed to publish risk rejection to Kafka topic {}: {}", riskRejectionsTopic, e.getMessage(), e);
+            log.error("CRITICAL: Failed to durably publish rejection {} to Kafka: {}", rejection.rejectionId(), e.getMessage(), e);
+            throw new RuntimeException("Durable rejection publication failed for " + rejection.rejectionId(), e);
         }
     }
 }

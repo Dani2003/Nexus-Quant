@@ -11,7 +11,9 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.Acknowledgment;
+import org.springframework.kafka.support.SendResult;
 
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -21,6 +23,7 @@ import static org.mockito.ArgumentMatchers.anyDouble;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -43,6 +46,9 @@ class MarketDataConsumerServiceTest {
 
     @BeforeEach
     void setUp() {
+        lenient().when(kafkaTemplate.send(anyString(), anyString(), anyString()))
+                .thenReturn(CompletableFuture.completedFuture(null));
+
         consumerService = new MarketDataConsumerService(
                 riskGrpcClient,
                 objectMapper,
@@ -51,13 +57,14 @@ class MarketDataConsumerServiceTest {
                 100.0,
                 "trade-orders",
                 "risk-rejections",
+                3000L,
                 50,
                 25L
         );
     }
 
     @Test
-    @DisplayName("Should validate tick, trigger gRPC RiskRequest, publish Order, and acknowledge Kafka offset")
+    @DisplayName("Should validate tick, trigger gRPC RiskRequest, durably publish Order, and acknowledge Kafka offset")
     void shouldProcessValidTickAndAcknowledge() throws Exception {
         String jsonTick = """
             {
@@ -115,7 +122,7 @@ class MarketDataConsumerServiceTest {
     }
 
     @Test
-    @DisplayName("Should detect and drop replayed duplicate tick via idempotency guard")
+    @DisplayName("Should detect and drop replayed duplicate tick via idempotency guard after durable completion")
     void shouldDropDuplicateTicks() throws Exception {
         String jsonTick = """
             {

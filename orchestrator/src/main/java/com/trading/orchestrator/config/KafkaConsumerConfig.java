@@ -11,7 +11,9 @@ import org.springframework.kafka.annotation.EnableKafka;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
 import org.springframework.kafka.core.ConsumerFactory;
 import org.springframework.kafka.core.DefaultKafkaConsumerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.listener.ContainerProperties;
+import org.springframework.kafka.listener.DeadLetterPublishingRecoverer;
 import org.springframework.kafka.listener.DefaultErrorHandler;
 import org.springframework.util.backoff.FixedBackOff;
 
@@ -21,8 +23,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Spring Kafka configuration wired with Java 21 Project Loom Virtual Threads
- * and manual acknowledgment tied to full processing completion.
+ * Spring Kafka configuration wired with Java 21 Project Loom Virtual Threads,
+ * manual acknowledgment tied to durable processing, and Dead Letter Topic (DLT) recovery.
  */
 @Configuration
 @EnableKafka
@@ -68,12 +70,15 @@ public class KafkaConsumerConfig {
     }
 
     /**
-     * Error handler with 3 retry attempts and exponential backoff.
+     * Error handler with 3 retry attempts and Dead Letter Publishing Recoverer.
+     * If all retries fail, routes the record to <topic>.DLT (e.g. market-ticks.DLT)
+     * with exception details embedded in Kafka headers.
      */
     @Bean
-    public DefaultErrorHandler kafkaErrorHandler() {
-        // Retry 3 times with 200ms delay between attempts before logging error
-        return new DefaultErrorHandler(new FixedBackOff(200L, 3L));
+    public DefaultErrorHandler kafkaErrorHandler(KafkaTemplate<String, String> kafkaTemplate) {
+        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(kafkaTemplate);
+        // Retry 3 times with 200ms delay between attempts, then route to Dead Letter Topic (.DLT)
+        return new DefaultErrorHandler(recoverer, new FixedBackOff(200L, 3L));
     }
 
     /**
