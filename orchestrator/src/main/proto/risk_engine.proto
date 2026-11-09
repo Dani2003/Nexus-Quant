@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package risk;
+
+option java_multiple_files = true;
+option java_package = "com.trading.orchestrator.grpc";
+option java_outer_classname = "RiskEngineProto";
+
+service RiskService {
+  rpc EvaluateRisk (RiskRequest) returns (RiskResponse);
+}
+
+message RiskRequest {
+  string portfolio_id = 1;
+  string asset_symbol = 2;
+  double proposed_trade_size = 3;
+  double current_price = 4;
+}
+
+message RiskResponse {
+  bool is_approved = 1;
+  double value_at_risk = 2;
+  int32 computation_time_ms = 3;
+}
+

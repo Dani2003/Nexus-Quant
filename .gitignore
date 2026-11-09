@@ -1,0 +1,27 @@
+# Build & Target artifacts
+target/
+**/target/
+*.class
+*.jar
+*.war
+
+# IDE & Editor files
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+**/logs/
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Cargo
+Cargo.lock.backup
+**/*.rs.bk
+
