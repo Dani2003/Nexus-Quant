@@ -119,3 +119,4 @@ public class MarketDataSimulatorService {
         return isSimulating.get();
     }
 }
+
