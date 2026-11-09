@@ -54,3 +54,4 @@ public record TradingEvent(
         );
     }
 }
+
