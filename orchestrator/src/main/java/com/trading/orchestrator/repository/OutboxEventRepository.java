@@ -14,3 +14,4 @@ import java.util.List;
 public interface OutboxEventRepository extends JpaRepository<OutboxEventEntity, String> {
     List<OutboxEventEntity> findByStatusOrderByCreatedAtAsc(String status, Pageable pageable);
 }
+

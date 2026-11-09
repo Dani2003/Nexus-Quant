@@ -59,3 +59,4 @@ public class OutboxEventEntity {
     public Long getSentAt() { return sentAt; }
     public void setSentAt(Long sentAt) { this.sentAt = sentAt; }
 }
+

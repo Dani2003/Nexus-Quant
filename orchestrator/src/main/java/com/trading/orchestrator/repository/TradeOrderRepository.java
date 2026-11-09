@@ -11,3 +11,4 @@ import java.util.List;
 public interface TradeOrderRepository extends JpaRepository<TradeOrderEntity, String> {
     List<TradeOrderEntity> findAllByOrderByTimestampDesc(Pageable pageable);
 }
+

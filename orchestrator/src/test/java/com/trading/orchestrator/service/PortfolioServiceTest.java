@@ -104,3 +104,4 @@ class PortfolioServiceTest {
         verify(kafkaTemplate).send(eq("trade-orders"), eq("TSLA"), contains("\"side\":\"SELL\""));
     }
 }
+

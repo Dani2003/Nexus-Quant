@@ -77,3 +77,4 @@ public class RiskDecisionEntity {
     public int getLatencyMs() { return latencyMs; }
     public long getTimestamp() { return timestamp; }
 }
+

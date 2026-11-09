@@ -11,3 +11,4 @@ import java.util.List;
 public interface RiskDecisionRepository extends JpaRepository<RiskDecisionEntity, String> {
     List<RiskDecisionEntity> findAllByOrderByTimestampDesc(Pageable pageable);
 }
+

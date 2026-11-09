@@ -10,3 +10,4 @@ import java.util.Optional;
 public interface IdempotencyClaimRepository extends JpaRepository<IdempotencyClaimEntity, String> {
     Optional<IdempotencyClaimEntity> findByFingerprint(String fingerprint);
 }
+

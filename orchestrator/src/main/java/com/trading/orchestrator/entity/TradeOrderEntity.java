@@ -66,3 +66,4 @@ public class TradeOrderEntity {
     public double getValueAtRisk() { return valueAtRisk; }
     public long getTimestamp() { return timestamp; }
 }
+
