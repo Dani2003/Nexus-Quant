@@ -15,20 +15,22 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.kafka.core.KafkaTemplate;
 
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -105,6 +107,19 @@ class TransactionalOutboxServiceTest {
     }
 
     @Test
+    @DisplayName("tryClaim should reclaim lease when active worker lease has expired")
+    void shouldReclaimExpiredLease() {
+        String fingerprint = "AAPL:175.0:1715000000000:100.0";
+        IdempotencyClaimEntity stale = new IdempotencyClaimEntity(fingerprint, "IN_FLIGHT");
+        when(idempotencyClaimRepository.findById(fingerprint)).thenReturn(Optional.of(stale));
+        when(idempotencyClaimRepository.reclaimStaleOrFailed(eq(fingerprint), anyLong(), anyLong())).thenReturn(1);
+
+        TransactionalOutboxService.ClaimResult result = outboxService.tryClaim(fingerprint);
+
+        assertEquals(TransactionalOutboxService.ClaimResult.NEW_CLAIM, result);
+    }
+
+    @Test
     @DisplayName("recordApprovedOrder should persist decision, order, outbox event, and complete claim")
     void shouldRecordApprovedOrderAtomically() throws Exception {
         String fingerprint = "MSFT:250.0:1715000001000:50.0";
@@ -162,5 +177,16 @@ class TransactionalOutboxServiceTest {
         assertEquals("SENT", event.getStatus());
         assertNotNull(event.getSentAt());
     }
-}
 
+    @Test
+    @DisplayName("processPendingOutboxEvents should only dispatch event if atomic claim succeeds")
+    void shouldCoordinateMultiInstanceOutboxDispatch() {
+        OutboxEventEntity event = new OutboxEventEntity("evt-99", "trade-orders", "AAPL", "{}");
+        when(outboxEventRepository.findByStatusOrderByCreatedAtAsc(eq("PENDING"), any())).thenReturn(List.of(event));
+        when(outboxEventRepository.claimOutboxEvent("evt-99")).thenReturn(0); // already claimed by peer
+
+        outboxService.processPendingOutboxEvents();
+
+        verify(kafkaTemplate, never()).send(anyString(), anyString(), anyString());
+    }
+}

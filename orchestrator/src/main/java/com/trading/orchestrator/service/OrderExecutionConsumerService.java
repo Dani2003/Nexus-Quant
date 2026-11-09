@@ -1,8 +1,10 @@
 package com.trading.orchestrator.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.trading.orchestrator.entity.ExecutionRecordEntity;
 import com.trading.orchestrator.model.ExecutionReport;
 import com.trading.orchestrator.model.Order;
+import com.trading.orchestrator.repository.ExecutionRecordRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -11,14 +13,17 @@ import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
+import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Event-Driven Order Execution Consumer that listens to the trade-orders topic.
  * Simulates downstream exchange/broker matching, produces execution fill reports,
- * and updates real-time portfolio holdings and cash balance.
+ * enforces durable execution deduplication (keyed by orderId) preventing double fills
+ * on outbox/Kafka replay, and updates real-time portfolio holdings and cash balance.
  */
 @Service
 public class OrderExecutionConsumerService {
@@ -29,6 +34,7 @@ public class OrderExecutionConsumerService {
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final AuditStorageService auditStorageService;
     private final PortfolioService portfolioService;
+    private final ExecutionRecordRepository executionRecordRepository;
     private final String executionsTopic;
     private final long publishTimeoutMs;
 
@@ -38,7 +44,7 @@ public class OrderExecutionConsumerService {
             AuditStorageService auditStorageService,
             @Value("${trading.kafka.trade-executions-topic:trade-executions}") String executionsTopic,
             @Value("${trading.kafka.publish-timeout-ms:3000}") long publishTimeoutMs) {
-        this(objectMapper, kafkaTemplate, auditStorageService, null, executionsTopic, publishTimeoutMs);
+        this(objectMapper, kafkaTemplate, auditStorageService, null, null, executionsTopic, publishTimeoutMs);
     }
 
     @Autowired
@@ -47,12 +53,14 @@ public class OrderExecutionConsumerService {
             KafkaTemplate<String, String> kafkaTemplate,
             AuditStorageService auditStorageService,
             PortfolioService portfolioService,
+            ExecutionRecordRepository executionRecordRepository,
             @Value("${trading.kafka.trade-executions-topic:trade-executions}") String executionsTopic,
             @Value("${trading.kafka.publish-timeout-ms:3000}") long publishTimeoutMs) {
         this.objectMapper = objectMapper;
         this.kafkaTemplate = kafkaTemplate;
         this.auditStorageService = auditStorageService;
         this.portfolioService = portfolioService;
+        this.executionRecordRepository = executionRecordRepository;
         this.executionsTopic = executionsTopic;
         this.publishTimeoutMs = publishTimeoutMs;
     }
@@ -61,24 +69,51 @@ public class OrderExecutionConsumerService {
             topics = "${trading.kafka.trade-orders-topic:trade-orders}",
             containerFactory = "kafkaListenerContainerFactory"
     )
+    @Transactional
     public void onTradeOrder(String orderPayload, Acknowledgment ack) {
         try {
             Order order = objectMapper.readValue(orderPayload, Order.class);
 
-            // Simulate realistic micro-slippage: +/- 0.02%
+            // 1. Durable Execution Deduplication Guard
+            // Prevents replayed/redelivered trade orders from executing double fills
+            if (executionRecordRepository != null && executionRecordRepository.existsById(order.orderId())) {
+                log.warn("[Duplicate Order Fill Skipped] OrderId {} has already been executed and filled. Skipping duplicate fill.",
+                        order.orderId());
+                if (ack != null) {
+                    ack.acknowledge();
+                }
+                return;
+            }
+
+            // 2. Simulate realistic micro-slippage: +/- 0.02%
             double slippageMultiplier = 1.0 + (ThreadLocalRandom.current().nextDouble(-0.0002, 0.0002));
             double executionPrice = Math.round(order.price() * slippageMultiplier * 100.0) / 100.0;
 
             ExecutionReport report = ExecutionReport.createFilled(order, executionPrice);
 
-            // Durably record execution report to Kafka
+            // 3. Durably persist execution record to prevent duplicate fills on future redeliveries
+            if (executionRecordRepository != null) {
+                ExecutionRecordEntity record = new ExecutionRecordEntity(
+                        order.orderId(),
+                        UUID.randomUUID().toString(),
+                        order.portfolioId(),
+                        order.symbol(),
+                        order.side(),
+                        order.quantity(),
+                        executionPrice,
+                        System.currentTimeMillis()
+                );
+                executionRecordRepository.save(record);
+            }
+
+            // 4. Durably record execution report to Kafka
             String jsonReport = objectMapper.writeValueAsString(report);
             kafkaTemplate.send(executionsTopic, report.symbol(), jsonReport)
                     .get(publishTimeoutMs, TimeUnit.MILLISECONDS);
 
             auditStorageService.recordExecution(report);
 
-            // Update real-time portfolio cash and position holdings
+            // 5. Update real-time portfolio cash and position holdings
             if (portfolioService != null) {
                 portfolioService.applyExecution(report);
             }

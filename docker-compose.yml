@@ -46,8 +46,13 @@ services:
       - risk-sidecar
     ports:
       - "8080:8080"
+    volumes:
+      - orchestrator-data:/app/data
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       RISK_GRPC_HOST: risk-sidecar
       RISK_GRPC_PORT: 50051
       RISK_THRESHOLD_PRICE: 150.0
+
+volumes:
+  orchestrator-data:

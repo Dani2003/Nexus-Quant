@@ -28,11 +28,12 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Transactional Outbox & Durable Idempotency Service.
- * Ensures:
- *  1. Atomic idempotency claims across concurrent workers and restarts.
+ * Features:
+ *  1. Atomic conditional idempotency claims across concurrent workers and restarts.
  *  2. Relational persistence of risk decisions and trade orders.
  *  3. Outbox event recording in the same DB transaction, eliminating dual-write inconsistencies.
  *  4. Synchronous immediate publishing with guaranteed background recovery poller.
+ *  5. Multi-instance coordination via atomic state transition claims.
  */
 @Service
 public class TransactionalOutboxService {
@@ -69,7 +70,7 @@ public class TransactionalOutboxService {
 
     /**
      * Atomically claims a tick fingerprint.
-     * Prevents race conditions among concurrent workers and blocks replay of already completed ticks.
+     * Uses atomic database conditional updates to eliminate race conditions among concurrent workers.
      */
     @Transactional
     public ClaimResult tryClaim(String fingerprint) {
@@ -79,21 +80,18 @@ public class TransactionalOutboxService {
             if ("COMPLETED".equalsIgnoreCase(claim.getStatus())) {
                 return ClaimResult.DUPLICATE_COMPLETED;
             }
-            if ("IN_FLIGHT".equalsIgnoreCase(claim.getStatus())) {
-                long elapsed = System.currentTimeMillis() - claim.getUpdatedAt();
-                // 30-second lease expiration for crashed or stuck workers
-                if (elapsed < 30_000) {
-                    return ClaimResult.DUPLICATE_IN_FLIGHT;
-                }
-                log.warn("[Idempotency] Reclaiming stale IN_FLIGHT claim for: {}", fingerprint);
-                claim.setStatus("IN_FLIGHT");
-                idempotencyClaimRepository.save(claim);
+
+            long now = System.currentTimeMillis();
+            long expirationThreshold = now - 30_000; // 30-second lease expiration for crashed workers
+
+            // Atomic conditional update to safely reclaim stale or failed claims without worker collisions
+            int updated = idempotencyClaimRepository.reclaimStaleOrFailed(fingerprint, now, expirationThreshold);
+            if (updated > 0) {
+                log.warn("[Idempotency] Successfully captured atomic lease for stale/failed claim: {}", fingerprint);
                 return ClaimResult.NEW_CLAIM;
+            } else {
+                return ClaimResult.DUPLICATE_IN_FLIGHT;
             }
-            // FAILED status allows clean retry
-            claim.setStatus("IN_FLIGHT");
-            idempotencyClaimRepository.save(claim);
-            return ClaimResult.NEW_CLAIM;
         }
 
         try {
@@ -258,20 +256,30 @@ public class TransactionalOutboxService {
 
     /**
      * Background outbox recovery poller ensuring at-least-once delivery
-     * even across abrupt process crashes.
+     * even across abrupt process crashes. Uses atomic claim to coordinate safely across replicas.
      */
     @Scheduled(fixedDelay = 5000)
+    @Transactional
     public void processPendingOutboxEvents() {
         try {
             List<OutboxEventEntity> pending = outboxEventRepository.findByStatusOrderByCreatedAtAsc("PENDING", PageRequest.of(0, 50));
             for (OutboxEventEntity event : pending) {
+                // Multi-instance atomic claim: transitions PENDING -> IN_FLIGHT
+                int claimed = outboxEventRepository.claimOutboxEvent(event.getEventId());
+                if (claimed == 0) {
+                    continue; // Another instance already claimed this event
+                }
+
                 try {
                     kafkaTemplate.send(event.getTopic(), event.getPartitionKey(), event.getPayload())
                             .get(3000, TimeUnit.MILLISECONDS);
                     markOutboxEventSent(event.getEventId());
                     log.info("[Outbox Poller] Successfully recovered and published event {}", event.getEventId());
                 } catch (Exception e) {
-                    log.warn("[Outbox Poller] Could not deliver pending event {}: {}", event.getEventId(), e.getMessage());
+                    log.warn("[Outbox Poller] Could not deliver claimed event {}: {}", event.getEventId(), e.getMessage());
+                    // Revert to PENDING so future runs can retry
+                    event.setStatus("PENDING");
+                    outboxEventRepository.save(event);
                 }
             }
         } catch (Exception e) {
@@ -279,4 +287,3 @@ public class TransactionalOutboxService {
         }
     }
 }
-

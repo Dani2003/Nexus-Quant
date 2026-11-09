@@ -1,6 +1,8 @@
 package com.trading.orchestrator.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.trading.orchestrator.entity.PortfolioEntity;
+import com.trading.orchestrator.entity.PositionEntity;
 import com.trading.orchestrator.model.ExecutionReport;
 import com.trading.orchestrator.model.MarketTick;
 import com.trading.orchestrator.model.Order;
@@ -8,11 +10,15 @@ import com.trading.orchestrator.model.OrderStatus;
 import com.trading.orchestrator.model.Portfolio;
 import com.trading.orchestrator.model.Position;
 import com.trading.orchestrator.model.TradingEvent;
+import com.trading.orchestrator.repository.PortfolioRepository;
+import com.trading.orchestrator.repository.PositionRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -24,11 +30,13 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Event-Driven Portfolio & Position Tracking Service with Automated Stop-Loss & Take-Profit Engine.
+ * Event-Driven Portfolio & Position Tracking Service with Durable Persistence and
+ * Automated Stop-Loss & Take-Profit Engine.
  * Features:
- *  1. Real-time Mark-to-Market (MtM) unrealized PnL updates on inbound market ticks.
- *  2. Realized PnL and cash balance tracking on order execution fill reports.
- *  3. Automated Stop-Loss & Take-Profit order generation for both LONG and SHORT exposures.
+ *  1. Relational persistence for portfolios, cash balances, and positions across restarts.
+ *  2. Real-time Mark-to-Market (MtM) unrealized PnL updates on inbound market ticks.
+ *  3. Realized PnL and cash balance tracking on order execution fill reports.
+ *  4. Automated Stop-Loss & Take-Profit order generation for both LONG and SHORT exposures.
  */
 @Service
 public class PortfolioService {
@@ -38,10 +46,12 @@ public class PortfolioService {
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final ObjectMapper objectMapper;
     private final AuditStorageService auditStorageService;
+    private final PortfolioRepository portfolioRepository;
+    private final PositionRepository positionRepository;
     private final String tradeOrdersTopic;
     private final long publishTimeoutMs;
 
-    // Concurrent Portfolio Store: portfolioId -> InternalPortfolioState
+    // In-memory cache for ultra-low-latency tick reading: portfolioId -> InternalPortfolioState
     private final Map<String, InternalPortfolioState> portfolios = new ConcurrentHashMap<>();
 
     public PortfolioService(
@@ -50,19 +60,62 @@ public class PortfolioService {
             AuditStorageService auditStorageService,
             @Value("${trading.kafka.trade-orders-topic:trade-orders}") String tradeOrdersTopic,
             @Value("${trading.kafka.publish-timeout-ms:3000}") long publishTimeoutMs) {
+        this(kafkaTemplate, objectMapper, auditStorageService, null, null, tradeOrdersTopic, publishTimeoutMs);
+    }
+
+    @Autowired
+    public PortfolioService(
+            KafkaTemplate<String, String> kafkaTemplate,
+            ObjectMapper objectMapper,
+            AuditStorageService auditStorageService,
+            PortfolioRepository portfolioRepository,
+            PositionRepository positionRepository,
+            @Value("${trading.kafka.trade-orders-topic:trade-orders}") String tradeOrdersTopic,
+            @Value("${trading.kafka.publish-timeout-ms:3000}") long publishTimeoutMs) {
         this.kafkaTemplate = kafkaTemplate;
         this.objectMapper = objectMapper;
         this.auditStorageService = auditStorageService;
+        this.portfolioRepository = portfolioRepository;
+        this.positionRepository = positionRepository;
         this.tradeOrdersTopic = tradeOrdersTopic;
         this.publishTimeoutMs = publishTimeoutMs;
     }
 
     /**
      * Applies an execution fill report to update cash and active positions.
+     * Persisted durably to relational storage within a database transaction.
      */
+    @Transactional
     public synchronized void applyExecution(ExecutionReport report) {
         InternalPortfolioState state = getOrCreateState(report.portfolioId());
         state.applyFill(report);
+
+        // Durable persistence to relational database
+        if (portfolioRepository != null) {
+            PortfolioEntity pEntity = portfolioRepository.findById(report.portfolioId())
+                    .orElseGet(() -> new PortfolioEntity(report.portfolioId(), state.cashBalance, state.totalRealizedPnl));
+            pEntity.setCashBalance(state.cashBalance);
+            pEntity.setTotalRealizedPnl(state.totalRealizedPnl);
+            portfolioRepository.save(pEntity);
+        }
+
+        if (positionRepository != null) {
+            Position pos = state.positions.get(report.symbol());
+            if (pos != null) {
+                PositionEntity posEntity = positionRepository.findByPortfolioIdAndSymbol(report.portfolioId(), report.symbol())
+                        .orElseGet(() -> new PositionEntity(
+                                report.portfolioId(), report.symbol(), pos.quantity(), pos.averageEntryPrice(),
+                                pos.currentMarketPrice(), pos.unrealizedPnl(), pos.realizedPnl(),
+                                pos.stopLossPrice(), pos.takeProfitPrice()));
+                posEntity.setQuantity(pos.quantity());
+                posEntity.setAverageEntryPrice(pos.averageEntryPrice());
+                posEntity.setCurrentMarketPrice(pos.currentMarketPrice());
+                posEntity.setUnrealizedPnl(pos.unrealizedPnl());
+                posEntity.setRealizedPnl(pos.realizedPnl());
+                positionRepository.save(posEntity);
+            }
+        }
+
         log.info("[Portfolio Updated] Portfolio: {} | Symbol: {} | Side: {} | FillPrice: {:.2f} | Total Equity: {:.2f}",
                 report.portfolioId(), report.symbol(), report.side(), report.executionPrice(), state.toPortfolio().totalEquity());
     }
@@ -150,8 +203,15 @@ public class PortfolioService {
                         System.currentTimeMillis()
                 ));
 
-                // Clear protection rules to prevent re-triggering while pending fill
+                // Clear protection rules in memory and DB to prevent re-triggering while pending fill
                 state.positions.put(pos.symbol(), pos.withProtectionRules(null, null));
+                if (positionRepository != null) {
+                    positionRepository.findByPortfolioIdAndSymbol(state.portfolioId, pos.symbol()).ifPresent(pe -> {
+                        pe.setStopLossPrice(null);
+                        pe.setTakeProfitPrice(null);
+                        positionRepository.save(pe);
+                    });
+                }
 
             } catch (Exception e) {
                 log.error("Failed to publish protective exit order for {}: {}", pos.symbol(), e.getMessage(), e);
@@ -162,6 +222,7 @@ public class PortfolioService {
     /**
      * Configures stop-loss and take-profit prices for a position.
      */
+    @Transactional
     public synchronized boolean setProtectionRules(String portfolioId, String symbol, Double stopLossPrice, Double takeProfitPrice) {
         InternalPortfolioState state = getOrCreateState(portfolioId);
         Position pos = state.positions.get(symbol);
@@ -170,6 +231,16 @@ public class PortfolioService {
         }
 
         state.positions.put(symbol, pos.withProtectionRules(stopLossPrice, takeProfitPrice));
+
+        // Durable persistence of protection rules
+        if (positionRepository != null) {
+            positionRepository.findByPortfolioIdAndSymbol(portfolioId, symbol).ifPresent(pe -> {
+                pe.setStopLossPrice(stopLossPrice);
+                pe.setTakeProfitPrice(takeProfitPrice);
+                positionRepository.save(pe);
+            });
+        }
+
         log.info("Set protection rules for {} in portfolio {}: StopLoss: {}, TakeProfit: {}",
                 symbol, portfolioId, stopLossPrice, takeProfitPrice);
         return true;
@@ -188,7 +259,40 @@ public class PortfolioService {
     }
 
     private InternalPortfolioState getOrCreateState(String portfolioId) {
-        return portfolios.computeIfAbsent(portfolioId, id -> new InternalPortfolioState(id, 1_000_000.0));
+        return portfolios.computeIfAbsent(portfolioId, id -> {
+            double initialCash = 1_000_000.0;
+            double initialRealizedPnl = 0.0;
+
+            // Load from database if available
+            if (portfolioRepository != null) {
+                var opt = portfolioRepository.findById(id);
+                if (opt.isPresent()) {
+                    initialCash = opt.get().getCashBalance();
+                    initialRealizedPnl = opt.get().getTotalRealizedPnl();
+                }
+            }
+
+            InternalPortfolioState state = new InternalPortfolioState(id, initialCash);
+            state.totalRealizedPnl = initialRealizedPnl;
+
+            if (positionRepository != null) {
+                List<PositionEntity> savedPositions = positionRepository.findByPortfolioId(id);
+                for (PositionEntity pe : savedPositions) {
+                    state.positions.put(pe.getSymbol(), new Position(
+                            pe.getSymbol(),
+                            pe.getQuantity(),
+                            pe.getAverageEntryPrice(),
+                            pe.getCurrentMarketPrice(),
+                            pe.getUnrealizedPnl(),
+                            pe.getRealizedPnl(),
+                            pe.getStopLossPrice(),
+                            pe.getTakeProfitPrice()
+                    ));
+                }
+            }
+
+            return state;
+        });
     }
 
     /**
@@ -244,4 +348,3 @@ public class PortfolioService {
         }
     }
 }
-
