@@ -27,7 +27,9 @@ trading:
   kafka:
     market-ticks-topic: ${KAFKA_MARKET_TICKS_TOPIC:market-ticks}
     trade-orders-topic: ${KAFKA_TRADE_ORDERS_TOPIC:trade-orders}
+    trade-executions-topic: ${KAFKA_TRADE_EXECUTIONS_TOPIC:trade-executions}
     risk-rejections-topic: ${KAFKA_RISK_REJECTIONS_TOPIC:risk-rejections}
+    publish-timeout-ms: ${KAFKA_PUBLISH_TIMEOUT_MS:3000}
     concurrency: ${KAFKA_CONCURRENCY:4}
   risk:
     grpc-host: ${RISK_GRPC_HOST:localhost}
@@ -36,3 +38,5 @@ trading:
     threshold-price: ${RISK_THRESHOLD_PRICE:150.0}
     default-proposed-trade-size: ${RISK_DEFAULT_TRADE_SIZE:100.0}
     grpc-deadline-ms: ${RISK_GRPC_DEADLINE_MS:50}
+    max-concurrent-evaluations: ${RISK_MAX_CONCURRENT_EVALUATIONS:50}
+    concurrency-timeout-ms: ${RISK_CONCURRENCY_TIMEOUT_MS:25}
