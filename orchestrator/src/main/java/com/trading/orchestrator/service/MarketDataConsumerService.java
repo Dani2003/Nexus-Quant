@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.trading.orchestrator.client.RiskGrpcClient;
 import com.trading.orchestrator.client.RiskServiceException;
+import com.trading.orchestrator.entity.OutboxEventEntity;
 import com.trading.orchestrator.grpc.RiskResponse;
 import com.trading.orchestrator.model.DecisionAuditRecord;
 import com.trading.orchestrator.model.MarketTick;
@@ -12,6 +13,7 @@ import com.trading.orchestrator.model.RiskRejection;
 import com.trading.orchestrator.model.TradingEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -32,10 +34,11 @@ import java.util.concurrent.TimeUnit;
  * Event-Driven Kafka Consumer service that listens to the market-ticks topic.
  * Fully utilizes Java 21 Project Loom Virtual Threads with:
  *  1. Reliable acknowledgment tied strictly to processing completion and durable Kafka publication.
- *  2. Bounded concurrency & overload policy via Semaphore.
- *  3. Strict input validation rejecting invalid/non-finite prices.
- *  4. Durable audit & idempotency tracking via AuditStorageService.
- *  5. Synchronous, verified publishing of orders and rejections to Kafka.
+ *  2. Atomic relational idempotency claim preventing concurrent worker races.
+ *  3. Transactional Outbox pattern eliminating dual-write inconsistencies.
+ *  4. Real-time Mark-to-Market PnL and automated Stop-Loss / Take-Profit protection via PortfolioService.
+ *  5. Bounded concurrency & overload policy via Semaphore.
+ *  6. Strict input validation rejecting invalid/non-finite prices.
  */
 @Service
 public class MarketDataConsumerService {
@@ -46,6 +49,8 @@ public class MarketDataConsumerService {
     private final ObjectMapper objectMapper;
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final AuditStorageService auditStorageService;
+    private final PortfolioService portfolioService;
+    private final TransactionalOutboxService outboxService;
 
     private final double priceThreshold;
     private final double defaultTradeSize;
@@ -56,7 +61,7 @@ public class MarketDataConsumerService {
     private final Semaphore concurrencyLimiter;
     private final long concurrencyTimeoutMs;
 
-    // Bounded LRU cache for tick idempotency deduplication (capacity: 10,000)
+    // Fast in-memory LRU cache for secondary deduplication fallback
     private final Set<String> processedTicksCache = Collections.newSetFromMap(
             new LinkedHashMap<String, Boolean>(10_000, 0.75f, true) {
                 @Override
@@ -71,6 +76,26 @@ public class MarketDataConsumerService {
             ObjectMapper objectMapper,
             KafkaTemplate<String, String> kafkaTemplate,
             AuditStorageService auditStorageService,
+            double priceThreshold,
+            double defaultTradeSize,
+            String tradeOrdersTopic,
+            String riskRejectionsTopic,
+            long publishTimeoutMs,
+            int maxConcurrentEvaluations,
+            long concurrencyTimeoutMs) {
+        this(riskGrpcClient, objectMapper, kafkaTemplate, auditStorageService, null, null,
+                priceThreshold, defaultTradeSize, tradeOrdersTopic, riskRejectionsTopic,
+                publishTimeoutMs, maxConcurrentEvaluations, concurrencyTimeoutMs);
+    }
+
+    @Autowired
+    public MarketDataConsumerService(
+            RiskGrpcClient riskGrpcClient,
+            ObjectMapper objectMapper,
+            KafkaTemplate<String, String> kafkaTemplate,
+            AuditStorageService auditStorageService,
+            PortfolioService portfolioService,
+            TransactionalOutboxService outboxService,
             @Value("${trading.risk.threshold-price:150.0}") double priceThreshold,
             @Value("${trading.risk.default-proposed-trade-size:100.0}") double defaultTradeSize,
             @Value("${trading.kafka.trade-orders-topic:trade-orders}") String tradeOrdersTopic,
@@ -83,6 +108,8 @@ public class MarketDataConsumerService {
         this.objectMapper = objectMapper;
         this.kafkaTemplate = kafkaTemplate;
         this.auditStorageService = auditStorageService;
+        this.portfolioService = portfolioService;
+        this.outboxService = outboxService;
         this.priceThreshold = priceThreshold;
         this.defaultTradeSize = defaultTradeSize;
         this.tradeOrdersTopic = tradeOrdersTopic;
@@ -160,26 +187,44 @@ public class MarketDataConsumerService {
             return;
         }
 
-        // 2. Check Idempotency Guard (Deduplication on Replay)
+        // 2. Check Idempotency Guard (Atomic database claim or in-memory fallback)
         String tickFingerprint = tick.symbol() + ":" + tick.price() + ":" + tick.timestamp() + ":" + tick.volume();
-        synchronized (processedTicksCache) {
-            if (processedTicksCache.contains(tickFingerprint) || auditStorageService.isFingerprintProcessed(tickFingerprint)) {
-                log.info("[Duplicate Tick Skipped] Idempotency guard detected replayed tick for {}", tickFingerprint);
+        if (outboxService != null) {
+            TransactionalOutboxService.ClaimResult claimResult = outboxService.tryClaim(tickFingerprint);
+            if (claimResult != TransactionalOutboxService.ClaimResult.NEW_CLAIM) {
+                log.info("[Duplicate Tick Skipped] Atomic idempotency claim detected duplicate status: {} for {}",
+                        claimResult, tickFingerprint);
                 return;
+            }
+        } else {
+            synchronized (processedTicksCache) {
+                if (processedTicksCache.contains(tickFingerprint) || auditStorageService.isFingerprintProcessed(tickFingerprint)) {
+                    log.info("[Duplicate Tick Skipped] In-memory idempotency guard detected replayed tick for {}", tickFingerprint);
+                    return;
+                }
+            }
+        }
+
+        // 3. Mark-to-Market Real-Time Valuation & Automated Stop-Loss / Take-Profit Trigger Check
+        if (portfolioService != null) {
+            try {
+                portfolioService.onMarketPriceTick(tick);
+            } catch (Exception e) {
+                log.error("Error evaluating portfolio protection rules for tick {}: {}", tick.symbol(), e.getMessage());
             }
         }
 
         log.info("[Tick Ingested] Symbol: {}, Price: {:.2f}, Volume: {}, Thread: {}",
                 tick.symbol(), tick.price(), tick.volume(), Thread.currentThread());
 
-        // 3. Price Threshold Check
+        // 4. Price Threshold Check
         if (tick.price() >= priceThreshold) {
             log.warn("[Threshold Exceeded] Symbol: {} price {:.2f} >= {:.2f}. Requesting Risk Evaluation...",
                     tick.symbol(), tick.price(), priceThreshold);
 
             double proposedTradeSize = tick.volume() != 0.0 ? tick.volume() : defaultTradeSize;
 
-            // 4. Bounded Concurrency & Overload Policy
+            // 5. Bounded Concurrency & Overload Policy
             boolean permitAcquired = false;
             try {
                 permitAcquired = concurrencyLimiter.tryAcquire(concurrencyTimeoutMs, TimeUnit.MILLISECONDS);
@@ -192,7 +237,20 @@ public class MarketDataConsumerService {
                 RiskRejection rejection = RiskRejection.create(
                         tick.portfolioId(), tick.symbol(), proposedTradeSize, tick.price(), 0.0,
                         "OVERLOAD_CONCURRENCY_LIMIT_EXCEEDED");
-                publishRejectionDurable(rejection);
+
+                if (outboxService != null) {
+                    try {
+                        OutboxEventEntity outboxEvent = outboxService.recordRejection(
+                                tickFingerprint, rejection, "REJECTED_OVERLOAD", 0, riskRejectionsTopic);
+                        outboxService.publishOutboxEventNow(outboxEvent, publishTimeoutMs);
+                    } catch (Exception e) {
+                        log.error("Outbox recording failed for overload rejection: {}", e.getMessage());
+                        publishRejectionDurable(rejection);
+                    }
+                } else {
+                    publishRejectionDurable(rejection);
+                }
+
                 auditStorageService.recordDecision(DecisionAuditRecord.create(
                         tickFingerprint, tick.portfolioId(), tick.symbol(), tick.price(),
                         proposedTradeSize, 0.0, "REJECTED_OVERLOAD", "OVERLOAD_CONCURRENCY_LIMIT_EXCEEDED", 0));
@@ -209,7 +267,7 @@ public class MarketDataConsumerService {
                 );
 
                 if (riskResponse.getIsApproved()) {
-                    // 5a. Publish Approved Order DURABLY
+                    // 6a. Publish Approved Order DURABLY via Transactional Outbox
                     Order approvedOrder = Order.createApproved(
                             tick.portfolioId(),
                             tick.symbol(),
@@ -219,7 +277,14 @@ public class MarketDataConsumerService {
                             riskResponse.getValueAtRisk()
                     );
 
-                    publishOrderDurable(approvedOrder);
+                    if (outboxService != null) {
+                        OutboxEventEntity outboxEvent = outboxService.recordApprovedOrder(
+                                tickFingerprint, approvedOrder, riskResponse, tradeOrdersTopic);
+                        outboxService.publishOutboxEventNow(outboxEvent, publishTimeoutMs);
+                    } else {
+                        publishOrderDurable(approvedOrder);
+                    }
+
                     auditStorageService.recordOrder(approvedOrder);
                     auditStorageService.recordDecision(DecisionAuditRecord.create(
                             tickFingerprint, tick.portfolioId(), tick.symbol(), tick.price(),
@@ -230,7 +295,7 @@ public class MarketDataConsumerService {
                             approvedOrder.orderId(), tick.symbol(), riskResponse.getValueAtRisk(), riskResponse.getComputationTimeMs());
 
                 } else {
-                    // 5b. Publish Rejected Decision DURABLY
+                    // 6b. Publish Rejected Decision DURABLY via Transactional Outbox
                     RiskRejection rejection = RiskRejection.create(
                             tick.portfolioId(),
                             tick.symbol(),
@@ -240,7 +305,15 @@ public class MarketDataConsumerService {
                             "RISK_TOLERANCE_BREACH_VAR_EXCEEDED"
                     );
 
-                    publishRejectionDurable(rejection);
+                    if (outboxService != null) {
+                        OutboxEventEntity outboxEvent = outboxService.recordRejection(
+                                tickFingerprint, rejection, "REJECTED_VAR_EXCEEDED",
+                                riskResponse.getComputationTimeMs(), riskRejectionsTopic);
+                        outboxService.publishOutboxEventNow(outboxEvent, publishTimeoutMs);
+                    } else {
+                        publishRejectionDurable(rejection);
+                    }
+
                     auditStorageService.recordDecision(DecisionAuditRecord.create(
                             tickFingerprint, tick.portfolioId(), tick.symbol(), tick.price(),
                             proposedTradeSize, riskResponse.getValueAtRisk(), "REJECTED_VAR_EXCEEDED",
@@ -250,6 +323,16 @@ public class MarketDataConsumerService {
                             tick.symbol(), riskResponse.getValueAtRisk());
                 }
 
+            } catch (RiskServiceException e) {
+                if (outboxService != null) {
+                    outboxService.markClaimFailed(tickFingerprint);
+                }
+                throw e;
+            } catch (Exception e) {
+                if (outboxService != null) {
+                    outboxService.markClaimFailed(tickFingerprint);
+                }
+                throw (e instanceof RuntimeException re) ? re : new RuntimeException("Error evaluating risk", e);
             } finally {
                 concurrencyLimiter.release();
             }
@@ -257,9 +340,12 @@ public class MarketDataConsumerService {
         } else {
             log.debug("[Normal Flow] Symbol: {} price {:.2f} < threshold {:.2f}. Skipping risk evaluation.",
                     tick.symbol(), tick.price(), priceThreshold);
+            if (outboxService != null) {
+                outboxService.recordCompletedNormalFlow(tickFingerprint);
+            }
         }
 
-        // 6. Record fingerprint into idempotency cache ONLY AFTER successful outcome recording
+        // 7. Record fingerprint into idempotency cache AFTER successful outcome recording
         synchronized (processedTicksCache) {
             processedTicksCache.add(tickFingerprint);
         }

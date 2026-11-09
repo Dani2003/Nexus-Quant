@@ -5,6 +5,7 @@ import com.trading.orchestrator.model.ExecutionReport;
 import com.trading.orchestrator.model.Order;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -16,7 +17,8 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Event-Driven Order Execution Consumer that listens to the trade-orders topic.
- * Simulates downstream exchange/broker matching and produces execution fill reports.
+ * Simulates downstream exchange/broker matching, produces execution fill reports,
+ * and updates real-time portfolio holdings and cash balance.
  */
 @Service
 public class OrderExecutionConsumerService {
@@ -26,6 +28,7 @@ public class OrderExecutionConsumerService {
     private final ObjectMapper objectMapper;
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final AuditStorageService auditStorageService;
+    private final PortfolioService portfolioService;
     private final String executionsTopic;
     private final long publishTimeoutMs;
 
@@ -35,9 +38,21 @@ public class OrderExecutionConsumerService {
             AuditStorageService auditStorageService,
             @Value("${trading.kafka.trade-executions-topic:trade-executions}") String executionsTopic,
             @Value("${trading.kafka.publish-timeout-ms:3000}") long publishTimeoutMs) {
+        this(objectMapper, kafkaTemplate, auditStorageService, null, executionsTopic, publishTimeoutMs);
+    }
+
+    @Autowired
+    public OrderExecutionConsumerService(
+            ObjectMapper objectMapper,
+            KafkaTemplate<String, String> kafkaTemplate,
+            AuditStorageService auditStorageService,
+            PortfolioService portfolioService,
+            @Value("${trading.kafka.trade-executions-topic:trade-executions}") String executionsTopic,
+            @Value("${trading.kafka.publish-timeout-ms:3000}") long publishTimeoutMs) {
         this.objectMapper = objectMapper;
         this.kafkaTemplate = kafkaTemplate;
         this.auditStorageService = auditStorageService;
+        this.portfolioService = portfolioService;
         this.executionsTopic = executionsTopic;
         this.publishTimeoutMs = publishTimeoutMs;
     }
@@ -56,12 +71,17 @@ public class OrderExecutionConsumerService {
 
             ExecutionReport report = ExecutionReport.createFilled(order, executionPrice);
 
-            // Durably record execution report
+            // Durably record execution report to Kafka
             String jsonReport = objectMapper.writeValueAsString(report);
             kafkaTemplate.send(executionsTopic, report.symbol(), jsonReport)
                     .get(publishTimeoutMs, TimeUnit.MILLISECONDS);
 
             auditStorageService.recordExecution(report);
+
+            // Update real-time portfolio cash and position holdings
+            if (portfolioService != null) {
+                portfolioService.applyExecution(report);
+            }
 
             log.info("[Order FILLED] OrderId: {} | Symbol: {} | Qty: {} | ExecPrice: {:.2f} (Requested: {:.2f})",
                     order.orderId(), order.symbol(), order.quantity(), executionPrice, order.price());
@@ -76,4 +96,3 @@ public class OrderExecutionConsumerService {
         }
     }
 }
-
