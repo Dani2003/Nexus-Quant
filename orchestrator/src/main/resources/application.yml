@@ -7,6 +7,16 @@ spring:
   threads:
     virtual:
       enabled: true # Enable Java 21 Project Loom Virtual Threads across Spring framework
+  datasource:
+    url: ${JDBC_DATABASE_URL:jdbc:h2:file:./data/nexus_quant_db;DB_CLOSE_DELAY=-1;AUTO_SERVER=TRUE}
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  jpa:
+    database-platform: org.hibernate.dialect.H2Dialect
+    hibernate:
+      ddl-auto: update
+    show-sql: false
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
     consumer:
