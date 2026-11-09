@@ -25,6 +25,7 @@ import java.util.concurrent.CompletableFuture;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -95,7 +96,7 @@ class TransactionalOutboxServiceTest {
     }
 
     @Test
-    @DisplayName("tryClaim should return DUPLICATE_IN_FLIGHT when active worker is holding the lease")
+    @DisplayName("tryClaim should return DUPLICATE_IN_FLIGHT when active worker holds the lease")
     void shouldDetectActiveInFlightClaim() {
         String fingerprint = "AAPL:175.0:1715000000000:100.0";
         IdempotencyClaimEntity inFlight = new IdempotencyClaimEntity(fingerprint, "IN_FLIGHT");
@@ -120,7 +121,7 @@ class TransactionalOutboxServiceTest {
     }
 
     @Test
-    @DisplayName("recordApprovedOrder should persist decision, order, outbox event, and complete claim")
+    @DisplayName("recordApprovedOrder should persist decision, order, outbox event as IN_FLIGHT, and complete claim")
     void shouldRecordApprovedOrderAtomically() throws Exception {
         String fingerprint = "MSFT:250.0:1715000001000:50.0";
         Order order = new Order("ord-1", "GROWTH", "MSFT", "BUY", 50.0, 250.0, OrderStatus.APPROVED, 150.0, 1715000001000L);
@@ -138,7 +139,8 @@ class TransactionalOutboxServiceTest {
         assertNotNull(outboxEvent);
         assertEquals("trade-orders", outboxEvent.getTopic());
         assertEquals("MSFT", outboxEvent.getPartitionKey());
-        assertEquals("PENDING", outboxEvent.getStatus());
+        // Initialized as IN_FLIGHT to prevent race with poller
+        assertEquals("IN_FLIGHT", outboxEvent.getStatus());
 
         verify(riskDecisionRepository).save(any());
         verify(tradeOrderRepository).save(any());
@@ -147,7 +149,7 @@ class TransactionalOutboxServiceTest {
     }
 
     @Test
-    @DisplayName("recordRejection should persist decision audit, outbox event, and complete claim")
+    @DisplayName("recordRejection should persist decision audit, outbox event as IN_FLIGHT, and complete claim")
     void shouldRecordRejectionAtomically() throws Exception {
         String fingerprint = "TSLA:300.0:1715000002000:200.0";
         RiskRejection rejection = RiskRejection.create("GROWTH", "TSLA", 200.0, 300.0, 95000.0, "VAR_EXCEEDED");
@@ -160,6 +162,7 @@ class TransactionalOutboxServiceTest {
         assertNotNull(outboxEvent);
         assertEquals("risk-rejections", outboxEvent.getTopic());
         assertEquals("TSLA", outboxEvent.getPartitionKey());
+        assertEquals("IN_FLIGHT", outboxEvent.getStatus());
         verify(riskDecisionRepository).save(any());
         verify(outboxEventRepository).save(any(OutboxEventEntity.class));
         assertEquals("COMPLETED", claim.getStatus());
@@ -179,14 +182,31 @@ class TransactionalOutboxServiceTest {
     }
 
     @Test
-    @DisplayName("processPendingOutboxEvents should only dispatch event if atomic claim succeeds")
-    void shouldCoordinateMultiInstanceOutboxDispatch() {
-        OutboxEventEntity event = new OutboxEventEntity("evt-99", "trade-orders", "AAPL", "{}");
-        when(outboxEventRepository.findByStatusOrderByCreatedAtAsc(eq("PENDING"), any())).thenReturn(List.of(event));
-        when(outboxEventRepository.claimOutboxEvent("evt-99")).thenReturn(0); // already claimed by peer
+    @DisplayName("publishOutboxEventNow should demote to PENDING on Kafka failure")
+    void shouldDemoteToPendingOnKafkaFailure() {
+        OutboxEventEntity event = new OutboxEventEntity("evt-fail", "trade-orders", "AAPL", "{\"orderId\":\"1\"}");
+        when(outboxEventRepository.findById("evt-fail")).thenReturn(Optional.of(event));
+
+        when(kafkaTemplate.send(anyString(), anyString(), anyString()))
+                .thenReturn(CompletableFuture.failedFuture(new RuntimeException("Broker down")));
+
+        assertThrows(RuntimeException.class, () -> outboxService.publishOutboxEventNow(event, 3000L));
+
+        assertEquals("PENDING", event.getStatus());
+        verify(outboxEventRepository).save(event);
+    }
+
+    @Test
+    @DisplayName("processPendingOutboxEvents should recover stale in-flight events and mark SENT")
+    void shouldRecoverStaleInFlightEvents() {
+        OutboxEventEntity staleEvent = new OutboxEventEntity("evt-stale", "trade-orders", "AAPL", "{}", "IN_FLIGHT");
+        when(outboxEventRepository.findPendingOrStaleInFlight(anyLong(), any())).thenReturn(List.of(staleEvent));
+        when(outboxEventRepository.claimOutboxEventWithLease(eq("evt-stale"), anyLong(), anyLong())).thenReturn(1);
+        when(outboxEventRepository.findById("evt-stale")).thenReturn(Optional.of(staleEvent));
 
         outboxService.processPendingOutboxEvents();
 
-        verify(kafkaTemplate, never()).send(anyString(), anyString(), anyString());
+        verify(kafkaTemplate).send(eq("trade-orders"), eq("AAPL"), eq("{}"));
+        assertEquals("SENT", staleEvent.getStatus());
     }
 }
