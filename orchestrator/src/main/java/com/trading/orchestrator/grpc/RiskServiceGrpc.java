@@ -104,5 +104,26 @@ public final class RiskServiceGrpc {
                     getChannel().newCall(getEvaluateRiskMethod(), getCallOptions()), request);
         }
     }
+
+    public static abstract class RiskServiceImplBase implements io.grpc.BindableService {
+        public void evaluateRisk(RiskRequest request, StreamObserver<RiskResponse> responseObserver) {
+            io.grpc.stub.ServerCalls.asyncUnimplementedUnaryCall(getEvaluateRiskMethod(), responseObserver);
+        }
+
+        @Override
+        public final io.grpc.ServerServiceDefinition bindService() {
+            return io.grpc.ServerServiceDefinition.builder(SERVICE_NAME)
+                    .addMethod(
+                            getEvaluateRiskMethod(),
+                            io.grpc.stub.ServerCalls.asyncUnaryCall(
+                                    new io.grpc.stub.ServerCalls.UnaryMethod<RiskRequest, RiskResponse>() {
+                                        @Override
+                                        public void invoke(RiskRequest request, StreamObserver<RiskResponse> responseObserver) {
+                                            evaluateRisk(request, responseObserver);
+                                        }
+                                    }))
+                    .build();
+        }
+    }
 }
 

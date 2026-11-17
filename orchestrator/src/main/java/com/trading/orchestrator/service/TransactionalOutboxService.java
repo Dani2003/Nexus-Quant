@@ -195,7 +195,7 @@ public class TransactionalOutboxService {
                 tickFingerprint,
                 rejection.portfolioId(),
                 rejection.symbol(),
-                rejection.price(),
+                rejection.currentPrice(),
                 rejection.proposedTradeSize(),
                 rejection.valueAtRisk(),
                 status,
